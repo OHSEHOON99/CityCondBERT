@@ -75,10 +75,13 @@ Most existing baselines treat mobility prediction as **classification over 40,00
 2. **n-gram similarity matrices:** for each n (1–5), slide over sequences to form predicted vs. true n-gram sets.  
 3. **Sinkhorn OT alignment:** treat n-gram sets as distributions; apply **entropy-regularized OT** with **log-domain Sinkhorn** to obtain a soft, differentiable alignment score.  
 4. **Loss aggregation:** weighted precision across n=1..5, combined with CE:  
-   \[
-   L = \alpha \cdot CE + (1-\alpha) \cdot (1 - \text{GeoBLEU})
-   \]
-   Start CE-heavy, then anneal \(\alpha\) to emphasize GeoBLEU.
+   Weighted precision across n = 1..5, combined with CE:
+
+   $$
+   L = \\alpha \\cdot CE + (1 - \\alpha) \\cdot \\big(1 - \\text{GeoBLEU}\\big)
+   $$
+
+   Start CE-heavy, then anneal \\( \\alpha \\) to emphasize GeoBLEU.
 
 **Key hyperparameters:**  
 ```python
