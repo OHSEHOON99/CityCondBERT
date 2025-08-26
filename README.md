@@ -78,7 +78,7 @@ Most existing baselines treat mobility prediction as **classification over 40,00
    Weighted precision across n = 1..5, combined with CE:
 
    $$
-   L = \\alpha \\cdot CE + (1 - \\alpha) \\cdot \\big(1 - \\text{GeoBLEU}\\big)
+   L = \alpha \cdot CE + (1 - \alpha) \cdot \big(1 - \text{GeoBLEU}\big)
    $$
 
    Start CE-heavy, then anneal $\alpha$ to emphasize GeoBLEU.
