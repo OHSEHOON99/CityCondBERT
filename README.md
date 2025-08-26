@@ -41,7 +41,7 @@ We **explicitly acknowledge** the above works; our code **adapts** these ideas a
 Human mobility features are heterogeneous: `location` is inherently **discrete**, `time/dow` are **periodic** (periods: **48** for time-of-day, **7** for day-of-week), and `delta` behaves like a **continuous** signal with long-tailed scales (e.g., inter-step displacement or time gap). Using a single representation introduces an unfavorable inductive bias. By combining **categorical**, **periodic**, and **learnable Fourier** encodings, we preserve (i) discrete vocab structure for grids, (ii) cyclic proximity for temporal features, and (iii) smooth/scale-robust behaviors for continuous deltas—leading to better generalization on sparse cells and more stable long-horizon forecasts.
 
 **How it plugs into the model (BERT-front embedding):**  
-At each timestep, per-feature encoders produce mode-specific embeddings (categorical / periodic / Fourier). We apply an **inner combine** rule (`cat` | `sum` | `mlp`) within each feature, then a **feature fusion (outer combine)** across features to form a single token embedding $ \mathbf{x}_t \in \mathbb{R}^{d_{model}} $. This token sequence is fed to the **BERT-style encoder**, optionally with positional embeddings. LayerNorm/Dropout after fusion stabilize training.
+At each timestep, per-feature encoders produce mode-specific embeddings (categorical / periodic / Fourier). We apply an **inner combine** rule (`cat` | `sum` | `mlp`) within each feature, then a **feature fusion (outer combine)** across features to form a single token embedding $\mathbf{x}_t \in \mathbb{R}^{d_{model}}$. This token sequence is fed to the **BERT-style encoder**, optionally with positional embeddings. LayerNorm/Dropout after fusion stabilize training.
 
 **Config-driven experimentation:**  
 Embedding choices are exposed in `config.py` for ablations and reproducibility:
@@ -81,7 +81,7 @@ Most existing baselines treat mobility prediction as **classification over 40,00
    L = \\alpha \\cdot CE + (1 - \\alpha) \\cdot \\big(1 - \\text{GeoBLEU}\\big)
    $$
 
-   Start CE-heavy, then anneal $ \alpha $ to emphasize GeoBLEU.
+   Start CE-heavy, then anneal $\alpha$ to emphasize GeoBLEU.
 
 **Key hyperparameters:**  
 ```python
