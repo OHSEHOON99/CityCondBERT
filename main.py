@@ -1,13 +1,17 @@
 # main.py
-import argparse, os, json, copy
+import argparse, os, json, copy, glob, re
 import torch
 import pandas as pd
+from datetime import datetime
 
 from train import train
 from model import MobilityBERT
 from data_loader import load_and_split_data
 from config import base_defaults
 from predict import *
+
+
+
 
 
 # -------------------------------
@@ -38,6 +42,83 @@ def args_to_dict(args):
     d = vars(args).copy()
     # 필요 시 내부 전용 키 제거 가능
     return {k: v for k, v in d.items() if v is not None}
+
+
+def _parse_ts(ts_str: str) -> datetime:
+    # 로컬시간 기준으로 기록된 폴더명이 보통이지만, 서로 비교만 하면 되므로 naive datetime 사용
+    return datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+
+
+def _scan_wandb_by_timestamp_fuzzy(wandb_dir: str, target_run_name: str, tolerance_sec: int = 5):
+    """
+    wandb_dir 이하 run-*/ 폴더명을 훑어 target_run_name에 들어있는 타임스탬프와
+    가장 가까운 run을 찾는다. 기본 허용 오차는 ±5초.
+    반환: (run_id, run_root) or (None, None)
+    """
+    m = re.search(r"(\d{8}_\d{6})", target_run_name)
+    if not m:
+        print(f"[W&B] No timestamp found in target_run_name={target_run_name}")
+        return None, None
+    target_ts = m.group(1)
+    target_dt = _parse_ts(target_ts)
+
+    # 두 종류 경로 모두 커버: <wandb_dir>/run-* 와 <wandb_dir>/wandb/run-*
+    candidates = []
+    for pat in (os.path.join(wandb_dir, "run-*"),
+                os.path.join(wandb_dir, "wandb", "run-*")):
+        for run_root in glob.glob(pat):
+            base = os.path.basename(run_root)
+            m2 = re.match(r"run-(\d{8}_\d{6})-([a-z0-9]+)", base)
+            if not m2:
+                continue
+            ts_str, run_id = m2.groups()
+            try:
+                dt = _parse_ts(ts_str)
+            except ValueError:
+                continue
+            diff = abs((dt - target_dt).total_seconds())
+            candidates.append((diff, dt, run_id, run_root))
+
+    if not candidates:
+        return None, None
+
+    # diff(초)가 가장 작은 후보 선택
+    candidates.sort(key=lambda x: (x[0], x[1]))  # (diff, dt)로 tie-break
+    best_diff, best_dt, best_id, best_root = candidates[0]
+
+    if best_diff <= tolerance_sec:
+        return best_id, best_root
+    else:
+        # 허용 오차를 넘으면 매칭 실패 처리
+        print(f"[W&B] Closest run is {best_dt.strftime('%Y%m%d_%H%M%S')} (Δ={int(best_diff)}s) > tolerance({tolerance_sec}s).")
+        return None, None
+
+
+def _resume_wandb_by_timestamp(wandb_dir: str, target_run_name: str,
+                               project: str, entity: str | None = None,
+                               tolerance_sec: int = 5):
+    """
+    폴더명(run-<ts>-<id>)에서 target_run_name의 ts와 가장 가까운 run을 찾아 resume.
+    tolerance_sec 내면 채택.
+    """
+    if wandb.run is not None:
+        return  # 이미 열린 run 사용
+
+    run_id, run_root = _scan_wandb_by_timestamp_fuzzy(wandb_dir, target_run_name, tolerance_sec=tolerance_sec)
+    if run_id is None:
+        print(f"[W&B] No run matched timestamp (±{tolerance_sec}s) for name='{target_run_name}' in {wandb_dir}. Skip resuming.")
+        return
+
+    print(f"[W&B] Resuming run id={run_id} (closest ts to {target_run_name}) from {run_root}")
+    wandb.init(
+        project=project,
+        entity=entity,
+        id=run_id,
+        resume="allow",
+        dir=wandb_dir,
+        reinit=True,
+        name=target_run_name
+    )
 
 
 # -------------------------------
@@ -89,39 +170,64 @@ def parse_args():
     p.add_argument('--lr', type=float, default=None)
     p.add_argument('--location_embedding_lr', type=float, default=None)
     p.add_argument('--num_epochs', type=int, default=None)
-
+    p.add_argument('--loss_name', type=str,
+                choices=['ce', 'ddce', 'geobleu'],
+                default=None,
+                help='Loss to use: ce | ddce | geobleu')
+    
     return p.parse_args()
 
 # -------------------------------
 # 3) model builder (dict 기반)
 # -------------------------------
 def build_model_from_config(cfg, device, num_locations):
-    # canonical 우선, legacy 호환
-    transformer_cfg = cfg.get("transformer", {
-        "hidden_size":     cfg["hidden_size"],
-        "hidden_layers":   cfg["hidden_layers"],
-        "attention_heads": cfg["attention_heads"],
-        "dropout":         cfg["dropout"],
-        "max_seq_length":  cfg["max_seq_length"],
-    })
+    # ----- 1) Transformer 설정 (canonical 우선, legacy 호환) -----
+    if "transformer" in cfg and isinstance(cfg["transformer"], dict):
+        transformer_cfg = cfg["transformer"]
+    else:
+        # legacy: 평탄화 키들을 요구
+        required = ["hidden_size", "hidden_layers", "attention_heads", "dropout", "max_seq_length"]
+        missing = [k for k in required if k not in cfg]
+        if missing:
+            raise KeyError(f"Missing transformer keys (legacy format expected): {missing}")
+        transformer_cfg = {
+            "hidden_size":     int(cfg["hidden_size"]),
+            "hidden_layers":   int(cfg["hidden_layers"]),
+            "attention_heads": int(cfg["attention_heads"]),
+            "dropout":         float(cfg["dropout"]),
+            "max_seq_length":  int(cfg["max_seq_length"]),
+        }
 
-    embedding_sizes = cfg.get("embedding_sizes", {
-        "day":      cfg["day_embedding_size"],
-        "time":     cfg["time_embedding_size"],
-        "dow":      cfg["day_of_week_embedding_size"],
-        "weekday":  cfg["weekday_embedding_size"],
-        "location": cfg["location_embedding_size"],
-    })
+    # ----- 2) Embedding sizes (canonical 우선, legacy 호환) -----
+    if "embedding_sizes" in cfg and isinstance(cfg["embedding_sizes"], dict):
+        embedding_sizes = cfg["embedding_sizes"]
+    else:
+        required = ["day_embedding_size", "time_embedding_size", "day_of_week_embedding_size",
+                    "weekday_embedding_size", "location_embedding_size"]
+        missing = [k for k in required if k not in cfg]
+        if missing:
+            raise KeyError(f"Missing embedding size keys (legacy format expected): {missing}")
+        embedding_sizes = {
+            "day":      int(cfg["day_embedding_size"]),
+            "time":     int(cfg["time_embedding_size"]),
+            "dow":      int(cfg["day_of_week_embedding_size"]),
+            "weekday":  int(cfg["weekday_embedding_size"]),
+            "location": int(cfg["location_embedding_size"]),
+        }
 
-    delta_embedding_dims = tuple(cfg["delta_embedding_dims"])
+    # ----- 3) Delta embedding dims -----
+    delta_embedding_dims = tuple(cfg.get("delta_embedding_dims", (8, 8, 8)))
 
-    # ✅ 기본은 base_defaults에 있으므로 여기선 REQUIRED
+    # ----- 4) Feature configs (canonical 요구) -----
+    if "feature_configs" not in cfg:
+        raise KeyError("`feature_configs` is required in the canonical config.")
     feature_configs = cfg["feature_configs"]
 
-    # ✅ 키 통일 (읽기만 호환)
+    # ----- 5) Combine mode key 호환 -----
     feature_combine_mode = cfg.get("feature_combine_mode",
-                            cfg.get("embedding_combine_mode", "cat"))
+                                   cfg.get("embedding_combine_mode", "cat"))
 
+    # ----- 6) 모델 생성 -----
     model = MobilityBERT(
         num_location_ids=num_locations,
         transformer_cfg=transformer_cfg,
@@ -208,6 +314,17 @@ def main():
 
     os.makedirs(output_dir, exist_ok=True)
     save_name = f"city_{can_cfg.get('city','A')}_results"
+
+    # === predict 직전 ===
+    wandb_dir = os.path.join(final_cfg["base_path"], "wandb", "wandb")
+    target_run_name = final_cfg["model_name"]  # 예: "MobilityBERT-20250819_155854"
+
+    _resume_wandb_by_timestamp(
+        wandb_dir=wandb_dir,
+        target_run_name=target_run_name,
+        project="ACM SIGSPATIAL Cup 2025",
+        entity=None,  # 팀/조직 계정 사용 중이면 지정
+    )
 
     geobleu, dtw, acc = predict(
         model=model,

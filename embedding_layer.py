@@ -195,7 +195,7 @@ class EmbeddingLayer(nn.Module):
             cfg = feature_configs["delta"]
             self.feature_blocks["delta"] = FeatureBlock(
                 categorical_dim=cfg.get("categorical_dim", None),
-                categorical_num=cfg.get("categororical_num", None),  # 주의: 오타 방지 필요시 수정
+                categorical_num=cfg.get("categorical_num", None),  # 주의: 오타 방지 필요시 수정
                 periodic_dim=cfg.get("periodic_dim", None),
                 periodic_period=cfg.get("periodic_period", None),
                 fourier_dims=delta_embedding_dims,

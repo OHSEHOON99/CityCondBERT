@@ -4,6 +4,7 @@ import geobleu
 import numpy as np
 import pandas as pd
 import torch
+import wandb
 
 from joblib import Parallel, delayed
 from tqdm import tqdm
@@ -15,29 +16,39 @@ from utils import *
 def evaluate_sequence(pred_xy, true_xy, day_seq, time_seq):
     """
     GEO-BLEU, DTW, Accuracy 계산 (day_seq, time_seq는 필수)
+    pred_xy, true_xy: 길이 T의 (x,y) 시퀀스 (list/ndarray 모두 허용)
     """
-    pred_seq = [(d, t, *p) for d, t, p in zip(day_seq, time_seq, pred_xy)]
-    true_seq = [(d, t, *t_) for d, t, t_ in zip(day_seq, time_seq, true_xy)]
+    # (d, t, x, y) 시퀀스 구성
+    pred_seq = [(int(d), int(t), int(p[0]), int(p[1])) for d, t, p in zip(day_seq, time_seq, pred_xy)]
+    true_seq = [(int(d), int(t), int(txy[0]), int(txy[1])) for d, t, txy in zip(day_seq, time_seq, true_xy)]
 
     geobleu_score = geobleu.calc_geobleu_single(pred_seq, true_seq)
-    dtw_dist = geobleu.calc_dtw_single(pred_seq, true_seq)
-    acc = np.mean([p == t for p, t in zip(pred_xy, true_xy)])
+    dtw_dist      = geobleu.calc_dtw_single(pred_seq,  true_seq)
+
+    # 정확도: 두 좌표가 모두 일치하는 시점의 비율
+    pred_xy_np = np.asarray(pred_xy)
+    true_xy_np = np.asarray(true_xy)
+    # shape=(T,), bool
+    match_mask = np.all(pred_xy_np == true_xy_np, axis=1)
+    acc = float(np.mean(match_mask))
 
     return geobleu_score, dtw_dist, acc
 
 
-def process_trajectory(trajectory_id, uid, day_seq, time_seq, pred_locs, true_locs):
-    pred_xy = id_to_xy(pred_locs)
-    true_xy = id_to_xy(true_locs)
+def process_trajectory(trajectory_id, uid, day_seq, time_seq, pred_locs, true_locs, grid_width=200):
+    # grid_width 기본 200 가정; 다른 값이면 명시적으로 넘겨주세요.
+    pred_xy = id_to_xy(pred_locs, grid_width=grid_width)
+    true_xy = id_to_xy(true_locs, grid_width=grid_width)
 
     geobleu_score, dtw_dist, accuracy = evaluate_sequence(pred_xy, true_xy, day_seq, time_seq)
 
     rows = []
-    for j in range(len(true_locs)):
+    T = len(true_locs)
+    for j in range(T):
         d = int(day_seq[j])
         t = int(time_seq[j])
-        true_x, true_y = true_xy[j]
-        pred_x, pred_y = pred_xy[j]
+        true_x, true_y = int(true_xy[j][0]), int(true_xy[j][1])
+        pred_x, pred_y = int(pred_xy[j][0]), int(pred_xy[j][1])
 
         rows.append({
             "trajectory_id": trajectory_id,
@@ -48,7 +59,7 @@ def process_trajectory(trajectory_id, uid, day_seq, time_seq, pred_locs, true_lo
             "true_y": true_y,
             "predict_x": pred_x,
             "predict_y": pred_y,
-            "seq_geobleu": geobleu_score,
+            "seq_geobleu": geobleu_score,  # 시퀀스 단위 지표를 각 시점에 복제 저장
             "seq_dtw": dtw_dist,
             "seq_accuracy": accuracy
         })
@@ -63,10 +74,10 @@ def predict(model, test_loader, device, output_dir="./results", save_name="test"
     input_rows = []
     output_rows = []
 
-    total_geobleu = 0.0
-    total_dtw = 0.0
-    total_accuracy = 0.0
-    total_tokens = 0
+    total_geobleu = 0.0   # 현재는 "트래젝토리 평균" 산식
+    total_dtw     = 0.0   # 동일
+    total_accuracy = 0.0  # 토큰 가중 평균
+    total_tokens   = 0
 
     trajectory_id_counter = 0
 
@@ -75,47 +86,51 @@ def predict(model, test_loader, device, output_dir="./results", save_name="test"
             input_seq_feature, historical_locations, predict_seq_feature, future_locations = batch[:4]
             uid_seq = batch[4]
 
-            input_seq_feature = input_seq_feature.to(device)
+            input_seq_feature   = input_seq_feature.to(device)
             historical_locations = historical_locations.to(device)
             predict_seq_feature = predict_seq_feature.to(device)
-            future_locations = future_locations.to(device)
+            future_locations    = future_locations.to(device)
 
             logits = model(input_seq_feature, historical_locations, predict_seq_feature)
-            preds = torch.argmax(logits, dim=-1)
+            preds  = torch.argmax(logits, dim=-1)   # (B, T_pred)
 
             B, _ = preds.shape
-            uid_seq = uid_seq.cpu().numpy()
+            uid_seq  = uid_seq.cpu().numpy()
             pred_locs = preds.cpu().numpy()
             true_locs = future_locations.cpu().numpy()
-            day_seq = predict_seq_feature[:, :, 0].cpu().numpy()
+
+            # feature 순서: [d, t, dow, is_weekday, delta_t]
+            day_seq  = predict_seq_feature[:, :, 0].cpu().numpy()
             time_seq = predict_seq_feature[:, :, 1].cpu().numpy()
 
-            results = Parallel(n_jobs=os.cpu_count()//2)(
+            n_jobs = max(1, (os.cpu_count() or 1) // 2)  # 안전 가드
+            results = Parallel(n_jobs=n_jobs)(
                 delayed(process_trajectory)(
                     trajectory_id_counter + i,
                     int(uid_seq[i]),
                     day_seq[i],
                     time_seq[i],
                     pred_locs[i],
-                    true_locs[i]
+                    true_locs[i],
+                    200  # grid_width 명시 (필요 시 수정)
                 ) for i in range(B)
             )
 
             for i, (rows, geobleu_score, dtw_dist, accuracy) in enumerate(results):
                 output_rows.extend(rows)
                 total_geobleu += geobleu_score
-                total_dtw += dtw_dist
-                num_tokens = len(true_locs[i])
+                total_dtw     += dtw_dist
+                num_tokens     = len(true_locs[i])
                 total_accuracy += accuracy * num_tokens
-                total_tokens += num_tokens
+                total_tokens   += num_tokens
 
-            # input row 기록은 병렬 처리할 필요 없음 (정답 좌표 기록용)
+            # 입력(과거) 시퀀스 기록: d=[:,0], t=[:,1]
             for i in range(B):
                 uid = int(uid_seq[i])
-                hist_day_seq = input_seq_feature[i, :, 1].cpu().numpy()
-                hist_time_seq = input_seq_feature[i, :, 2].cpu().numpy()
-                hist_loc_ids = historical_locations[i].cpu().numpy()
-                hist_xy = id_to_xy(hist_loc_ids)
+                hist_day_seq  = input_seq_feature[i, :, 0].cpu().numpy()  # FIX: day
+                hist_time_seq = input_seq_feature[i, :, 1].cpu().numpy()  # FIX: time
+                hist_loc_ids  = historical_locations[i].cpu().numpy()
+                hist_xy       = id_to_xy(hist_loc_ids, grid_width=200)    # 일관성 유지
 
                 input_rows.extend([
                     {
@@ -132,17 +147,25 @@ def predict(model, test_loader, device, output_dir="./results", save_name="test"
             trajectory_id_counter += B
 
     # 평균 지표 출력
-    avg_geobleu = total_geobleu / trajectory_id_counter
-    avg_dtw = total_dtw / trajectory_id_counter
-    avg_accuracy = total_accuracy / total_tokens
+    # 주의: GEO-BLEU/DTW는 "트래젝토리 평균", Accuracy는 "토큰 가중 평균" (의도에 맞게 통일 권장)
+    denom = max(1, trajectory_id_counter)
+    avg_geobleu = total_geobleu / denom
+    avg_dtw     = total_dtw     / denom
+    avg_accuracy = total_accuracy / max(1, total_tokens)
 
     for row in output_rows:
-        row["avg_geobleu"] = avg_geobleu
-        row["avg_dtw"] = avg_dtw
+        row["avg_geobleu"]  = avg_geobleu
+        row["avg_dtw"]      = avg_dtw
         row["avg_accuracy"] = avg_accuracy
 
-    pd.DataFrame(input_rows).to_csv(f"{output_dir}/{save_name}_input.csv", index=False)
-    pd.DataFrame(output_rows).to_csv(f"{output_dir}/{save_name}_output.csv", index=False)
+    wandb.log({
+        "test/geobleu": avg_geobleu,
+        "test/dtw":     avg_dtw,
+        "test/acc":     avg_accuracy,
+    })
+
+    pd.DataFrame(input_rows).to_csv(os.path.join(output_dir, f"{save_name}_input.csv"),  index=False)
+    pd.DataFrame(output_rows).to_csv(os.path.join(output_dir, f"{save_name}_output.csv"), index=False)
 
     return avg_geobleu, avg_dtw, avg_accuracy
 
@@ -185,6 +208,7 @@ def pad_predict_sequence(df_masked, predict_seq_len):
         dummy_rows['is_dummy'] = True
         df_masked = pd.concat([df_masked, dummy_rows], ignore_index=True)
     return df_masked
+
 
 
 def predict_masked_uid(model, df_all, config, device, city='A', output_path=None):
