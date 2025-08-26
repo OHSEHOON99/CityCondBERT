@@ -1,0 +1,98 @@
+{
+    "schema_version": "1.0.0",
+    "city": "A",
+    "num_location_ids": 40000,
+    "transformer": {
+        "hidden_size": 256,
+        "hidden_layers": 8,
+        "attention_heads": 8,
+        "dropout": 0.1,
+        "max_seq_length": 3600
+    },
+    "embedding_sizes": {
+        "day": 32,
+        "time": 32,
+        "dow": 32,
+        "weekday": 16,
+        "location": 128
+    },
+    "delta_embedding_dims": [
+        8,
+        8,
+        8
+    ],
+    "feature_configs": {
+        "day": {
+            "modes": [
+                "categorical"
+            ],
+            "combine_mode_inner": "cat"
+        },
+        "time": {
+            "modes": [
+                "categorical",
+                "periodic"
+            ],
+            "combine_mode_inner": "cat"
+        },
+        "dow": {
+            "modes": [
+                "categorical",
+                "periodic"
+            ],
+            "combine_mode_inner": "cat"
+        },
+        "weekday": {
+            "modes": [
+                "categorical"
+            ],
+            "combine_mode_inner": "cat"
+        },
+        "location": {
+            "modes": [
+                "categorical"
+            ],
+            "combine_mode_inner": "cat"
+        },
+        "delta": {
+            "modes": [
+                "fourier"
+            ],
+            "combine_mode_inner": "cat"
+        }
+    },
+    "feature_combine_mode": "cat",
+    "loss": {
+        "name": "combo",
+        "kwargs": {
+            "ce_name": "ce",
+            "ce_kwargs": {
+                "ignore_index": null,
+                "reduction": "mean"
+            },
+            "geobleu_kwargs": {
+                "H": 200,
+                "W": 200,
+                "n_list": [
+                    1,
+                    2,
+                    3,
+                    4,
+                    5
+                ],
+                "win": 7,
+                "beta": 0.5,
+                "cell_km_x": 0.5,
+                "cell_km_y": 0.5,
+                "distance_scale": 2.0,
+                "eps": 0.1,
+                "n_iters": 30,
+                "weights": null
+            },
+            "alpha_init": 1.0,
+            "ema_m": 0.99,
+            "track_mavg": true,
+            "skip_geobleu_when_alpha_ge": 0.999
+        }
+    }
+}
