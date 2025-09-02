@@ -1,288 +1,356 @@
 import os
+from collections import defaultdict
 
-import geobleu
 import numpy as np
 import pandas as pd
 import torch
-import wandb
-
 from joblib import Parallel, delayed
 from tqdm import tqdm
 
-from utils import *
+from geobleu import calc_geobleu_single, calc_dtw_single
+from utils import safe_ids_to_xy
+from config import ID2CITY
 
 
 
-def evaluate_sequence(pred_xy, true_xy, day_seq, time_seq):
-    """
-    GEO-BLEU, DTW, Accuracy 계산 (day_seq, time_seq는 필수)
-    pred_xy, true_xy: 길이 T의 (x,y) 시퀀스 (list/ndarray 모두 허용)
-    """
-    # (d, t, x, y) 시퀀스 구성
-    pred_seq = [(int(d), int(t), int(p[0]), int(p[1])) for d, t, p in zip(day_seq, time_seq, pred_xy)]
-    true_seq = [(int(d), int(t), int(txy[0]), int(txy[1])) for d, t, txy in zip(day_seq, time_seq, true_xy)]
-
-    geobleu_score = geobleu.calc_geobleu_single(pred_seq, true_seq)
-    dtw_dist      = geobleu.calc_dtw_single(pred_seq,  true_seq)
-
-    # 정확도: 두 좌표가 모두 일치하는 시점의 비율
-    pred_xy_np = np.asarray(pred_xy)
-    true_xy_np = np.asarray(true_xy)
-    # shape=(T,), bool
-    match_mask = np.all(pred_xy_np == true_xy_np, axis=1)
-    acc = float(np.mean(match_mask))
-
-    return geobleu_score, dtw_dist, acc
-
-
-def process_trajectory(trajectory_id, uid, day_seq, time_seq, pred_locs, true_locs, grid_width=200):
-    # grid_width 기본 200 가정; 다른 값이면 명시적으로 넘겨주세요.
-    pred_xy = id_to_xy(pred_locs, grid_width=grid_width)
-    true_xy = id_to_xy(true_locs, grid_width=grid_width)
-
-    geobleu_score, dtw_dist, accuracy = evaluate_sequence(pred_xy, true_xy, day_seq, time_seq)
-
-    rows = []
-    T = len(true_locs)
-    for j in range(T):
-        d = int(day_seq[j])
-        t = int(time_seq[j])
-        true_x, true_y = int(true_xy[j][0]), int(true_xy[j][1])
-        pred_x, pred_y = int(pred_xy[j][0]), int(pred_xy[j][1])
-
-        rows.append({
-            "trajectory_id": trajectory_id,
-            "uid": uid,
-            "d": d,
-            "t": t,
-            "true_x": true_x,
-            "true_y": true_y,
-            "predict_x": pred_x,
-            "predict_y": pred_y,
-            "seq_geobleu": geobleu_score,  # 시퀀스 단위 지표를 각 시점에 복제 저장
-            "seq_dtw": dtw_dist,
-            "seq_accuracy": accuracy
-        })
-
-    return rows, geobleu_score, dtw_dist, accuracy
-
-
-def predict(model, test_loader, device, output_dir="./results", save_name="test"):
+def predict(
+    model,
+    test_loader,
+    device,
+    output_dir="./results",
+    W=200,
+    save_csv=True
+):
     model.eval()
     os.makedirs(output_dir, exist_ok=True)
 
-    input_rows = []
-    output_rows = []
+    # --- 새 경로 (요구사항) ---
+    pred_dir   = os.path.join(output_dir, "test")
+    metric_dir = os.path.join(output_dir, "metric")
+    os.makedirs(pred_dir, exist_ok=True)
+    os.makedirs(metric_dir, exist_ok=True)
 
-    total_geobleu = 0.0   # 현재는 "트래젝토리 평균" 산식
-    total_dtw     = 0.0   # 동일
-    total_accuracy = 0.0  # 토큰 가중 평균
-    total_tokens   = 0
+    # 버퍼: 도시별 토큰 / UID 묶음
+    tok_buf_per_city = defaultdict(list)
+    uid_rows = []
 
-    trajectory_id_counter = 0
+    # 전역 micro 정확도
+    total_tokens = 0
+    total_correct = 0
 
-    with torch.no_grad():
-        for batch in tqdm(test_loader, desc="[Predict]", ncols=100):
-            input_seq_feature, historical_locations, predict_seq_feature, future_locations = batch[:4]
-            uid_seq = batch[4]
+    # 도시별 micro 정확도 누적
+    city_tokens  = defaultdict(int)
+    city_correct = defaultdict(int)
 
-            input_seq_feature   = input_seq_feature.to(device)
-            historical_locations = historical_locations.to(device)
-            predict_seq_feature = predict_seq_feature.to(device)
-            future_locations    = future_locations.to(device)
+    # --- ID -> 도시 문자열 태그 ---
+    def city_tag(cid: int) -> str:
+        try:
+            return str(ID2CITY.get(int(cid), str(cid)))
+        except Exception:
+            return str(cid)
 
-            logits = model(input_seq_feature, historical_locations, predict_seq_feature)
-            preds  = torch.argmax(logits, dim=-1)   # (B, T_pred)
+    def compute_metrics_np(d_i, t_i, p_i, y_i):
+        if p_i.size == 0:
+            return None
+        pred_xy = safe_ids_to_xy(p_i, W)
+        true_xy = safe_ids_to_xy(y_i, W)
+        pred_seq = list(zip(d_i, t_i, pred_xy[:, 0], pred_xy[:, 1]))
+        true_seq = list(zip(d_i, t_i, true_xy[:, 0], true_xy[:, 1]))
+        g = calc_geobleu_single(pred_seq, true_seq)
+        d = calc_dtw_single(pred_seq, true_seq)
+        acc = float((p_i == y_i).mean())
+        return g, d, acc
 
-            B, _ = preds.shape
-            uid_seq  = uid_seq.cpu().numpy()
-            pred_locs = preds.cpu().numpy()
-            true_locs = future_locations.cpu().numpy()
+    with torch.inference_mode():
+        for batch in tqdm(test_loader, desc="[Predict-MLM]", ncols=100):
+            if len(batch) == 5:
+                feats, labels, attn_mask, uids, city_ids = batch
+            else:
+                feats, labels, attn_mask, uids = batch
+                city_ids = torch.ones_like(uids, dtype=torch.long)
 
-            # feature 순서: [d, t, dow, is_weekday, delta_t]
-            day_seq  = predict_seq_feature[:, :, 0].cpu().numpy()
-            time_seq = predict_seq_feature[:, :, 1].cpu().numpy()
+            feats     = feats.to(device, non_blocking=True)
+            labels    = labels.to(device, non_blocking=True)
+            attn_mask = attn_mask.to(device, non_blocking=True)
+            uids      = uids.to(device, non_blocking=True)
+            city_ids  = city_ids.to(device, non_blocking=True)
 
-            n_jobs = max(1, (os.cpu_count() or 1) // 2)  # 안전 가드
-            results = Parallel(n_jobs=n_jobs)(
-                delayed(process_trajectory)(
-                    trajectory_id_counter + i,
-                    int(uid_seq[i]),
-                    day_seq[i],
-                    time_seq[i],
-                    pred_locs[i],
-                    true_locs[i],
-                    200  # grid_width 명시 (필요 시 수정)
-                ) for i in range(B)
+            logits_masked, mask_pos = model(feats, attn_mask, labels=labels, city_ids=city_ids)
+            if not mask_pos.any().item():
+                continue
+
+            # --- 배치 평탄화 ---
+            b_idx, t_idx = torch.where(mask_pos)
+            true_all = labels[b_idx, t_idx].detach().cpu().numpy()
+            pred_all = torch.argmax(logits_masked, dim=-1).detach().cpu().numpy()
+
+            d_all = (feats[b_idx, t_idx, 0] - 1).detach().cpu().numpy().astype(np.int32)
+            t_all = (feats[b_idx, t_idx, 1] - 1).detach().cpu().numpy().astype(np.int32)
+            uid_all  = uids[b_idx].detach().cpu().numpy()
+            city_all = city_ids[b_idx].detach().cpu().numpy()
+
+            # --- 전역 micro ---
+            total_tokens  += true_all.size
+            batch_correct = int((pred_all == true_all).sum())
+            total_correct += batch_correct
+
+            # --- 도시별 micro 누적 ---
+            if true_all.size:
+                sort_c = np.argsort(city_all, kind="mergesort")
+                c_sorted = city_all[sort_c]
+                eq_sorted = (pred_all[sort_c] == true_all[sort_c]).astype(np.int32)
+                uniq_c, start_c, counts_c = np.unique(c_sorted, return_index=True, return_counts=True)
+                for cid, s, c in zip(uniq_c, start_c, counts_c):
+                    city_tokens[int(cid)]  += int(c)
+                    city_correct[int(cid)] += int(eq_sorted[s:s+c].sum())
+
+            # --- UID 그룹핑 ---
+            sort_idx = np.argsort(uid_all, kind="mergesort")
+            uid_s = uid_all[sort_idx]
+            d_s   = d_all[sort_idx]
+            t_s   = t_all[sort_idx]
+            p_s   = pred_all[sort_idx]
+            y_s   = true_all[sort_idx]
+            c_s   = city_all[sort_idx]
+
+            uniq_uid, start_idx, counts = np.unique(uid_s, return_index=True, return_counts=True)
+            city_per_uid = c_s[start_idx]
+
+            results = Parallel(n_jobs=8)(
+                delayed(compute_metrics_np)(d_s[s:s+c], t_s[s:s+c], p_s[s:s+c], y_s[s:s+c])
+                for s, c in zip(start_idx, counts)
             )
 
-            for i, (rows, geobleu_score, dtw_dist, accuracy) in enumerate(results):
-                output_rows.extend(rows)
-                total_geobleu += geobleu_score
-                total_dtw     += dtw_dist
-                num_tokens     = len(true_locs[i])
-                total_accuracy += accuracy * num_tokens
-                total_tokens   += num_tokens
+            for u, cty, c, res in zip(uniq_uid.astype(np.int64), city_per_uid.astype(np.int64), counts, results):
+                if res is None:
+                    continue
+                g, d, acc = res
+                row = {
+                    "uid": int(u),
+                    "city_id": int(cty),
+                    "seq_len": int(c),
+                    "geobleu": float(g),
+                    "dtw": float(d),
+                    "acc": float(acc),
+                    "city": city_tag(int(cty)),
+                }
+                uid_rows.append(row)
 
-            # 입력(과거) 시퀀스 기록: d=[:,0], t=[:,1]
-            for i in range(B):
-                uid = int(uid_seq[i])
-                hist_day_seq  = input_seq_feature[i, :, 0].cpu().numpy()  # FIX: day
-                hist_time_seq = input_seq_feature[i, :, 1].cpu().numpy()  # FIX: time
-                hist_loc_ids  = historical_locations[i].cpu().numpy()
-                hist_xy       = id_to_xy(hist_loc_ids, grid_width=200)    # 일관성 유지
+            # --- 토큰 CSV 버퍼에 저장 ---
+            if save_csv:
+                pred_xy = safe_ids_to_xy(pred_all, W).astype(np.int32, copy=False)
+                true_xy = safe_ids_to_xy(true_all, W).astype(np.int32, copy=False)
+                df_tok = pd.DataFrame({
+                    "uid": uid_all.astype(np.int64, copy=False),
+                    "city_id": city_all.astype(np.int32, copy=False),
+                    "d": d_all,
+                    "t": t_all,
+                    "true_x": true_xy[:, 0],
+                    "true_y": true_xy[:, 1],
+                    "predict_x": pred_xy[:, 0],
+                    "predict_y": pred_xy[:, 1],
+                })
+                for cid, gdf in df_tok.groupby("city_id", sort=False):
+                    tag = city_tag(int(cid))
+                    tok_buf_per_city[tag].append(gdf)
 
-                input_rows.extend([
-                    {
-                        "trajectory_id": trajectory_id_counter + i,
-                        "uid": uid,
-                        "d": int(d),
-                        "t": int(t),
-                        "true_x": int(x),
-                        "true_y": int(y)
-                    }
-                    for d, t, (x, y) in zip(hist_day_seq, hist_time_seq, hist_xy)
-                ])
+    # --- UID 메트릭: 도시별 파일 저장 ---
+    df_uid = pd.DataFrame(uid_rows) if uid_rows else pd.DataFrame(
+        columns=["uid","city_id","seq_len","geobleu","dtw","acc","city"]
+    )
+    if save_csv and not df_uid.empty:
+        for tag, gdf in df_uid.groupby("city", sort=False):
+            gdf.drop(columns=["city"], errors="ignore").to_csv(
+                os.path.join(metric_dir, f"city_{tag}.csv"), index=False
+            )
 
-            trajectory_id_counter += B
+    # --- 토큰 CSV: 도시별 저장 ---
+    if save_csv:
+        for tag, buflist in tok_buf_per_city.items():
+            df_all = pd.concat(buflist, ignore_index=True) if buflist else pd.DataFrame()
+            df_all.to_csv(os.path.join(pred_dir, f"city_{tag}.csv"), index=False)
 
-    # 평균 지표 출력
-    # 주의: GEO-BLEU/DTW는 "트래젝토리 평균", Accuracy는 "토큰 가중 평균" (의도에 맞게 통일 권장)
-    denom = max(1, trajectory_id_counter)
-    avg_geobleu = total_geobleu / denom
-    avg_dtw     = total_dtw     / denom
-    avg_accuracy = total_accuracy / max(1, total_tokens)
+    # --- summary.txt ---
+    summary_path = os.path.join(output_dir, "summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        avg_geobleu = float(df_uid["geobleu"].mean()) if not df_uid.empty else 0.0
+        avg_dtw     = float(df_uid["dtw"].mean())     if not df_uid.empty else 0.0
+        avg_acc     = float(total_correct / max(1, total_tokens))
 
-    for row in output_rows:
-        row["avg_geobleu"]  = avg_geobleu
-        row["avg_dtw"]      = avg_dtw
-        row["avg_accuracy"] = avg_accuracy
+        f.write("[Global]\n")
+        f.write(f"tokens={total_tokens}, acc_micro={avg_acc:.6f}, geobleu_macro_uid={avg_geobleu:.6f}, dtw_macro_uid={avg_dtw:.6f}\n\n")
 
-    wandb.log({
-        "test/geobleu": avg_geobleu,
-        "test/dtw":     avg_dtw,
-        "test/acc":     avg_accuracy,
-    })
+        if not df_uid.empty or city_tokens:
+            f.write("[Per City]\n")
+            seen_cids = set(int(c) for c in df_uid["city_id"].unique()) if not df_uid.empty else set()
+            seen_cids |= set(city_tokens.keys())
+            for cid in sorted(seen_cids):
+                tag = city_tag(int(cid))
+                n_tok = city_tokens.get(int(cid), 0)
+                n_cor = city_correct.get(int(cid), 0)
+                acc_micro = (n_cor / n_tok) if n_tok > 0 else 0.0
 
-    pd.DataFrame(input_rows).to_csv(os.path.join(output_dir, f"{save_name}_input.csv"),  index=False)
-    pd.DataFrame(output_rows).to_csv(os.path.join(output_dir, f"{save_name}_output.csv"), index=False)
+                if not df_uid.empty:
+                    sub = df_uid[df_uid["city_id"] == cid]
+                    geobleu_macro = float(sub["geobleu"].mean()) if not sub.empty else 0.0
+                    dtw_macro     = float(sub["dtw"].mean())     if not sub.empty else 0.0
+                    acc_macro     = float(sub["acc"].mean())     if not sub.empty else 0.0
+                    n_uids        = int(sub["uid"].nunique())
+                    n_tokens_uid  = int(sub["seq_len"].sum())
+                else:
+                    geobleu_macro = dtw_macro = acc_macro = 0.0
+                    n_uids = n_tokens_uid = 0
 
-    return avg_geobleu, avg_dtw, avg_accuracy
+                f.write(
+                    f"city={tag} | tokens={n_tok}, acc_micro={acc_micro:.6f}, "
+                    f"uids={n_uids}, tokens_uid_sum={n_tokens_uid}, "
+                    f"geobleu_macro_uid={geobleu_macro:.6f}, dtw_macro_uid={dtw_macro:.6f}, acc_macro_uid={acc_macro:.6f}\n"
+                )
+    # ===== WandB logging (per-city + global) =====
+    try:
+        import wandb
+        # global
+        wandb.log({
+            "test/geobleu": float(df_uid["geobleu"].mean()) if not df_uid.empty else 0.0,
+            "test/dtw": float(df_uid["dtw"].mean()) if not df_uid.empty else 0.0,
+            "test/acc": float(total_correct / max(1, total_tokens))
+        })
+
+        # per-city
+        if not df_uid.empty or city_tokens:
+            seen_cids = set(int(c) for c in df_uid["city_id"].unique()) if not df_uid.empty else set()
+            seen_cids |= set(city_tokens.keys())
+            for cid in sorted(seen_cids):
+                tag = city_tag(int(cid))
+                n_tok = city_tokens.get(int(cid), 0)
+                n_cor = city_correct.get(int(cid), 0)
+                acc_micro = (n_cor / n_tok) if n_tok > 0 else 0.0
+
+                if not df_uid.empty:
+                    sub = df_uid[df_uid["city_id"] == cid]
+                    geobleu_macro = float(sub["geobleu"].mean()) if not sub.empty else 0.0
+                    dtw_macro     = float(sub["dtw"].mean())     if not sub.empty else 0.0
+                    acc_macro     = float(sub["acc"].mean())     if not sub.empty else 0.0
+                    n_uids        = int(sub["uid"].nunique())
+                else:
+                    geobleu_macro = dtw_macro = acc_macro = 0.0
+                    n_uids = 0
+
+                wandb.log({
+                    f"{tag}/geobleu": geobleu_macro,
+                    f"{tag}/dtw": dtw_macro,
+                    f"{tag}/acc": acc_macro
+                })
+    except Exception:
+        pass
+
+    return avg_geobleu, avg_dtw, avg_acc
 
 
-########################################################################################################################
+# ---------------------------
+# Predict masked UID segments (submission-style) -> save under results/mask
+# ---------------------------
+@torch.no_grad()
+def predict_masked_uid(
+    model,
+    mask_loader,
+    device,
+    city="A",                 # "A" | "B" | "C" | "D" | "ALL"
+    output_dir="./results",
+    W=200,
+    team_name="SCSI"
+):
+    """
+    Save files under: {output_dir}/mask
+    - city == "ALL": write {team}_cityA_humob25.csv, ..., {team}_cityD_humob25.csv
+    - else          : write {team}_city{city}_humob25.csv
+    """
 
+    model.eval()
+    mask_dir = os.path.join(output_dir, "mask")
+    os.makedirs(mask_dir, exist_ok=True)
 
-def compute_dow_is_weekday(day, city='A'):
-    if city in ['C', 'D']:
-        dow = (day - 60 + 2) % 7 if day >= 60 else day % 7
-    else:
-        dow = day % 7
-    is_weekday = 1 if 2 <= dow <= 6 else 0
-    return dow, is_weekday
+    if mask_loader is None:
+        print("[predict_masked_uid] mask_loader is None. Nothing to do.")
+        return pd.DataFrame(columns=["uid", "d", "t", "x", "y"])
 
+    city_upper = str(city).upper()
 
-def generate_sequence(df, grid_width=200):
-    seq_x, seq_y = [], []
-    df = df.sort_values(['d', 't']).reset_index(drop=True)
-    prev_d, prev_t = df.loc[0, 'd'], df.loc[0, 't']
-    for _, row in df.iterrows():
-        d, t = row['d'], row['t']
-        days = d - 1
-        prev_days = prev_d - 1
-        delta_t = (days * 48 + t) - (prev_days * 48 + prev_t)
-        dow = days % 7
-        is_weekday = 1 if 2 <= dow <= 6 else 0
-        label = xy_to_id(row['x'], row['y'], grid_width) if row['x'] != 999 else 0
-        seq_x.append([d, t, dow, is_weekday, delta_t])
-        seq_y.append(label)
-        prev_d, prev_t = d, t
-    return np.array(seq_x), np.array(seq_y)
+    # fallback id->letter (dataset이 1~4면 이 매핑 사용)
+    fallback_id2city = {1: "A", 2: "B", 3: "C", 4: "D"}
 
+    # city == ALL 이면 도시별 버킷으로 누적
+    per_city_rows = defaultdict(list)
+    single_city_rows = []  # 단일 도시 모드에서만 사용
 
-def pad_predict_sequence(df_masked, predict_seq_len):
-    df_masked['is_dummy'] = False
-    remain = len(df_masked) % predict_seq_len
-    if remain > 0:
-        dummy_rows = df_masked.iloc[[-1] * (predict_seq_len - remain)].copy()
-        dummy_rows['is_dummy'] = True
-        df_masked = pd.concat([df_masked, dummy_rows], ignore_index=True)
-    return df_masked
+    pbar = tqdm(mask_loader, desc=f"[Predict-999|city={city_upper}]", ncols=100)
+    for batch in pbar:
+        if len(batch) == 5:
+            feats_pad, labels_mlm, attention_mask, uids, city_ids = batch
+        else:
+            feats_pad, labels_mlm, attention_mask, uids = batch
+            city_ids = torch.full((uids.shape[0],), 1, dtype=torch.long)
 
+        feats_pad = feats_pad.to(device, non_blocking=True)
+        labels_mlm = labels_mlm.to(device, non_blocking=True)
+        attention_mask = attention_mask.to(device, non_blocking=True)
+        uids = uids.to(device, non_blocking=True)
+        city_ids = city_ids.to(device, non_blocking=True)
 
+        logits_masked, mask_pos = model(
+            feats_pad, attention_mask, labels=labels_mlm, city_ids=city_ids
+        )  # logits_masked: (N_mask,V), mask_pos: (B,L)
 
-def predict_masked_uid(model, df_all, config, device, city='A', output_path=None):
-    input_seq_len = config.get("input_seq_length", 240)
-    predict_seq_len = config.get("predict_seq_length", 48)
-
-    grid_width = 200
-    predicted_rows = []
-
-    for uid in tqdm(df_all['uid'].unique(), desc="Predicting masked UIDs", unit="uid"):
-        df_uid = df_all[df_all['uid'] == uid].copy().sort_values(['d', 't'])
-        df_input = df_uid[df_uid['d'] <= 60]
-        df_masked = df_uid[(df_uid['d'] > 60) & (df_uid['x'] == 999)].copy()
-        if df_masked.empty:
+        if not mask_pos.any().item():
             continue
 
-        df_masked = pad_predict_sequence(df_masked, predict_seq_len)
-        input_x_np, input_y_np = generate_sequence(df_input, grid_width)
+        B, L = mask_pos.shape
+        pred_ids_all = torch.argmax(logits_masked, dim=-1).long()  # (N_mask,)
 
-        input_x_np = input_x_np[-input_seq_len:]
-        input_y_np = input_y_np[-input_seq_len:]
+        counts = mask_pos.sum(dim=1).tolist()
+        offsets = np.cumsum([0] + counts)
 
-        input_seq_feature = torch.tensor(input_x_np, dtype=torch.long, device=device).unsqueeze(0)
-        hist_locs = torch.tensor(input_y_np, dtype=torch.long, device=device).unsqueeze(0)
+        for b in range(B):
+            n = counts[b]
+            if n == 0:
+                continue
 
-        prev_d, prev_t = df_input.iloc[-1]['d'], df_input.iloc[-1]['t']
-        prev_d = prev_d - 1
+            s, e = offsets[b], offsets[b + 1]
+            pos_b = mask_pos[b].nonzero(as_tuple=True)[0]  # (n,)
 
-        for start in range(0, len(df_masked), predict_seq_len):
-            chunk = df_masked.iloc[start:start + predict_seq_len]
-            predict_feats = []
-            for _, row in chunk.iterrows():
-                d, t = row['d'], row['t']
-                days = d - 1
-                prev_days = prev_d - 1
-                delta_t = (days * 48 + t) - (prev_days * 48 + prev_t)
-                dow, is_weekday = compute_dow_is_weekday(days, city)
-                predict_feats.append([days, t, dow, is_weekday, delta_t])
-                prev_d, prev_t = d, t
+            d_b = (feats_pad[b, pos_b, 0] - 1).detach().cpu().numpy().astype(np.int64)
+            t_b = (feats_pad[b, pos_b, 1] - 1).detach().cpu().numpy().astype(np.int64)
+            uid_b = int(uids[b].item())
+            pred_ids_b = pred_ids_all[s:e].detach().cpu().numpy()
+            pred_xy_b = safe_ids_to_xy(pred_ids_b, W).astype(np.int64)
 
-            predict_feat_tensor = torch.tensor([predict_feats], dtype=torch.long, device=device)
+            # 이 샘플의 city tag 결정
+            cid_b = int(city_ids[b].item())
+            tag_b = fallback_id2city.get(cid_b, str(cid_b))  # ex) 1->"A"
 
-            # print("input_seq_feature:", input_seq_feature.min(), input_seq_feature.max()) ############################
-            # print("hist_locs:", hist_locs.min(), hist_locs.max()) ########################
-            # print("predict_feat_tensor:", predict_feat_tensor.min(), predict_feat_tensor.max()) ########################
+            # rows 작성
+            for (dd, tt), (px, py) in zip(zip(d_b, t_b), pred_xy_b):
+                row = {"uid": uid_b, "d": int(dd), "t": int(tt), "x": int(px), "y": int(py)}
+                if city_upper == "ALL":
+                    per_city_rows[tag_b].append(row)
+                else:
+                    single_city_rows.append(row)
 
-            with torch.no_grad():
-                # print(f"predict_feat_tensor : {predict_feat_tensor}") ##############
-                logits = model(input_seq_feature, hist_locs, predict_feat_tensor)
-                pred_labels = torch.argmax(logits, dim=-1).squeeze(0).cpu().numpy()
-
-            pred_coords = id_to_xy(pred_labels, grid_width=grid_width)
-            # print(f"pred_labels : {pred_labels}") ###################
-            # print(f"pred_coords : {pred_coords}") ###################
-
-            for idx, (x, y) in enumerate(pred_coords):
-                row = chunk.iloc[idx]
-                predicted_rows.append({
-                    'uid': uid,
-                    'd': int(row['d']),  # 복원
-                    't': int(row['t']),
-                    'predict_x': x,
-                    'predict_y': y,
-                    'is_dummy': bool(row.get('is_dummy', False))
-                })
-
-            new_input_seq = torch.tensor(predict_feats, dtype=torch.long, device=device).unsqueeze(0)
-            new_hist = torch.tensor(pred_labels, dtype=torch.long, device=device).unsqueeze(0)
-
-            input_seq_feature = torch.cat([input_seq_feature[:, predict_seq_len:], new_input_seq], dim=1)
-            hist_locs = torch.cat([hist_locs[:, predict_seq_len:], new_hist], dim=1)
-
-    df_pred = pd.DataFrame(predicted_rows)
-
-    if output_path:
-        df_pred.to_csv(output_path, index=False)
-        print(f"Masked uid predictions saved to: {output_path}")
+    # === 저장 ===
+    if city_upper == "ALL":
+        dfs = {}
+        for tag, rows in sorted(per_city_rows.items()):
+            df = pd.DataFrame(rows, columns=["uid", "d", "t", "x", "y"])
+            if not df.empty:
+                df = df.sort_values(["uid", "d", "t"]).reset_index(drop=True)
+            dfs[tag] = df
+            fname = f"{team_name}_city{tag}_humob25.csv"
+            fpath = os.path.join(mask_dir, fname)
+            df.to_csv(fpath, index=False)
+    else:
+        df_pred = pd.DataFrame(single_city_rows, columns=["uid", "d", "t", "x", "y"])
+        if not df_pred.empty:
+            df_pred = df_pred.sort_values(["uid", "d", "t"]).reset_index(drop=True)
+        fname = f"{team_name}_city{city_upper}_humob25.csv"
+        fpath = os.path.join(mask_dir, fname)
+        df_pred.to_csv(fpath, index=False)
