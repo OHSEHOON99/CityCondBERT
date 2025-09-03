@@ -171,7 +171,7 @@ $$
 Aggregate over n-grams with weights $w_n$:
 
 $$
-\mathcal{L}_{\mathrm{GeoBLEU}} = -\sum_{n=1}^{5} w_n \log(q_n)
+\mathcal{L}_{\mathrm{GeoBLEU}} = - \sum_{n=1}^{5} w_n \log(q_n)
 $$
 
 ---
