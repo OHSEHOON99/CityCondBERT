@@ -156,7 +156,7 @@ This mimics BLEU’s n-gram precision but remains differentiable.
   <img src="figs/geobleusinkhornloss.png" alt="n-gram Similarity Matrix S(n) for n=2" width="700"/>
 </p>
 
-<p align="center"><em>Figure 3. N-gram Similarity Matrix $S^{(n)}$ for $n=2$.</em></p>
+<p align="center"><em>Figure 3. N-gram Similarity Matrix for n=2.</em></p>
 
 **4) Sinkhorn alignment.**  
 Each $S^{(n)}$ is softly aligned via entropy-regularized OT:
@@ -188,7 +188,7 @@ Our training follows a **pretrain → finetune** paradigm:
   Starting from the pretrained weights, the model is finetuned on each target city using a **combo loss**:  
 
   $$
-  L = \alpha \cdot \mathrm{CE} + (1 - \alpha) L_{\mathrm{GeoBLEU}}
+  L = \alpha \cdot L_{\mathrm{CE}} + (1 - \alpha) L_{\mathrm{GeoBLEU}}
   $$
 
   with an **α-scheduler** that gradually shifts focus from CE to GeoBLEU, balancing token-level accuracy and trajectory-level coherence.  
