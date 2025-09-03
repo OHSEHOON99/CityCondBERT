@@ -4,164 +4,249 @@
 **Lead Contributor:** **Sehoon Oh** (Master’s Student)  
 **Track:** 2025 GIS Cup – HuMob Challenge, Track 2 (Phase 1)
 
-> **Current best (City A)**: **GEO-BLEU 0.1733** (test)
-
 ---
 
 ## 1. Overview
 
-Our system builds on a strong baseline and adds:  
-1. **Multi-modal feature embeddings** (categorical / periodic / learnable Fourier) across **spatio-temporal** features.  
-2. A new **differentiable training objective** `GeoBleuSinkhornLoss`, aligning predicted vs. reference trajectories using **entropy-regularized optimal transport** in an n-gram–like manner.  
-3. A **BERT-style encoder** that treats mobility prediction as **masked sequence modeling**, with an option to extend to **sequence-to-sequence forecasting** for future trajectories.
+Our system introduces four key components:
+
+1. **Multi-feature spatio-temporal embeddings**  
+
+2. **CityCondBERT architecture for cross-city transfer**  
+
+3. **Differentiable objective: `GeoBleuSinkhornLoss`**  
+
+4. **Learning strategy**
 
 ---
 
-## 2. Baseline & Borrowed Components (Attributions)
+## 2. Problem Definition
 
-- **Backbone**: **ST-MoE-BERT**  
-  He, H., Luo, H., & Wang, Q. R. (2024). *ST-MoE-BERT: A Spatial-Temporal Mixture-of-Experts Framework for Long-Term Cross-City Mobility Prediction.* In Proc. of the 2nd ACM SIGSPATIAL Workshop on Human Mobility Prediction Challenge (pp. 10-15).  
-  [GitHub](https://github.com/he-h/ST-MoE-BERT/tree/main)
+We address the task of **masked trajectory recovery**, where the goal is to reconstruct missing location tokens in a user’s spatio-temporal mobility sequence.
 
-- **Learnable Fourier Features (continuous signals)**  
-  Li, Y., Si, S., Li, G., Hsieh, C. J., & Bengio, S. (2021). *Learnable Fourier features for multi-dimensional spatial positional encoding.* NeurIPS 34, 15816-15829.
+Each user \(u\) has a (sparse) trajectory
+\[
+\mathcal{T}_u=\big\{(d^{(i)},\, t^{(i)},\, x^{(i)},\, y^{(i)})\in\mathbb{Z}^4 \ \big|\ i=1,\dots,N_u\big\},
+\]
+where \(d^{(i)}\in[1,75]\) is the day index, \(t^{(i)}\in[1,48]\) the half-hour slot, and \(x^{(i)},y^{(i)}\in[1,200]\) the grid coordinates.
 
-- **Periodic Encodings (temporal cyclicity)**  
-  Wu, X., He, H., Wang, Y., & Wang, Q. (2024). *Pretrained mobility transformer: A foundation model for human mobility.* arXiv:2406.02578.
+From \(\mathcal{T}_u\), we derive an enriched sequence
+\[
+S_u=\big\{(d^{(i)},\, l^{(i)},\, t^{(i)},\, w^{(i)},\, b^{(i)},\, \delta^{(i)})\ \big|\ i=1,\dots,N_u\big\},
+\]
+where \(l^{(i)}=(y^{(i)}-1)\cdot 200 + x^{(i)}\in\{1,\dots,40000\}\).
 
-We **explicitly acknowledge** the above works; our code **adapts** these ideas and integrates them into a unified **FeatureBlock** and training pipeline.
+Here, \(w^{(i)}\in\{1,\dots,7\}\) denotes the day-of-week, \(b^{(i)}\in\{1,2\}\) the weekday/weekend indicator (1 = weekday, 2 = weekend), and \(\delta^{(i)}\ge 0\) the time gap since the previous observation.
+
+We define a fixed masking window over the final 15 days:  
+\[
+\mathcal{M}_u = \left\{ i \;\middle|\; d^{(i)} \in [61, 75] \right\}, \quad l^{(i)} = \texttt{[MASK]} = 40001 \text{ if } i \in \mathcal{M}_u
+\]  
+Here, **40001 explicitly marks “to-be-predicted” locations**, following the masking strategy adopted in prior work such as ST-MoE-BERT [[1]](#ref1).
+
+
+Because \(N_u\) varies across users, we pad each sequence to a batch length \(L\) with PAD \(=0\); padded positions are excluded from attention (\(\texttt{attention\_mask}=0\)), while masked-future tokens \(i\in\mathcal{M}_u\) remain active.
+
+The model learns a mapping function
+\[
+f_\theta(S_u)=\big\{\,l^{(i)} \ \big|\ i\in\mathcal{M}_u \big\},
+\]
+by minimizing the prediction error **only at masked positions** using both masked and unmasked parts of \(S_u\).
 
 ---
 
 ## 3. Key Contributions
 
-### 3.1 Multi-Modal Feature Embeddings
+### 3.1 Multi-Feature Embeddings
 
-**Why multiple representations?**  
-Human mobility features are heterogeneous: `location` is inherently **discrete**, `time/dow` are **periodic** (periods: **48** for time-of-day, **7** for day-of-week), and `delta` behaves like a **continuous** signal with long-tailed scales (e.g., inter-step displacement or time gap). Using a single representation introduces an unfavorable inductive bias. By combining **categorical**, **periodic**, and **learnable Fourier** encodings, we preserve (i) discrete vocab structure for grids, (ii) cyclic proximity for temporal features, and (iii) smooth/scale-robust behaviors for continuous deltas—leading to better generalization on sparse cells and more stable long-horizon forecasts.
+**Motivation.**  
+The enriched features \((d^{(i)},\, t^{(i)},\, l^{(i)},\, w^{(i)},\, b^{(i)},\, \delta^{(i)})\) differ in nature: discrete grids, cyclic calendar variables, and continuous gaps.  
+To exploit these signals, we design complementary encoders:  
+- **Categorical embeddings** for discrete IDs  
+- **Periodic encodings** for cyclic proximity, following Wu et al. (2024) [[2]](#ref2)  
+- **Learnable Fourier features** for continuous deltas, following Li et al. (2021) [[3]](#ref3)  
 
-**How it plugs into the model (BERT-front embedding):**  
-At each timestep, per-feature encoders produce mode-specific embeddings (categorical / periodic / Fourier). We apply an **inner combine** rule (`cat` | `sum` | `mlp`) within each feature, then a **feature fusion (outer combine)** across features to form a single token embedding:
+| Feature              | Notation      | Type / Encoding               | Dim.   |
+|----------------------|---------------|-------------------------------|--------|
+| Day index            | \(d^{(i)}\)  | Categorical                   | 64     |
+| Time-of-day          | \(t^{(i)}\)  | Categorical ⊕ Periodic (48)  | 64 + 64|
+| Day-of-week          | \(w^{(i)}\)  | Categorical ⊕ Periodic (7)   | 32 + 32|
+| Weekday/Weekend flag | \(b^{(i)}\)  | Categorical                   | 16     |
+| Location (grid ID)   | \(l^{(i)}\)  | Categorical                   | 256    |
+| Delta (time gap)     | \(\delta^{(i)}\) | Learnable Fourier (`log1p`) | 16     |
 
-$$
-\mathbf{x} \in \mathbb{R}^{d_{model}}
-$$
+<br>
 
-This token sequence is fed to the **BERT-style encoder**, optionally with positional embeddings. LayerNorm/Dropout after fusion stabilize training.
+<p align="center">
+  <img src="figs/embedding_layer.png" alt="Embedding Layer" width="700"/>
+</p>
 
-**Config-driven experimentation:**  
-Embedding choices are exposed in `config.py` for ablations and reproducibility:
+<p align="center"><em>Figure 1. Embedding layer design combining categorical, periodic, and Fourier encoders.</em></p>
 
-```python
-def default_feature_configs():
-    return {
-        "day":      {"modes": ["categorical"],                 "combine_mode_inner": "cat"},
-        "time":     {"modes": ["categorical", "periodic"],     "combine_mode_inner": "cat", "period": 48},
-        "dow":      {"modes": ["categorical", "periodic"],     "combine_mode_inner": "cat", "period": 7},
-        "weekday":  {"modes": ["categorical"],                 "combine_mode_inner": "cat"},
-        "location": {"modes": ["categorical"],                 "combine_mode_inner": "cat"},
-        "delta":    {"modes": ["fourier"],                     "combine_mode_inner": "cat"}
-    }
-```
+\[
+E = 64 + (64+64) + (32+32) + 16 + 256 + 16 = \mathbf{544}
+\]
 
----
-
-### 3.2 `GeoBleuSinkhornLoss`
-
-**Why we needed a new loss:**  
-Most existing baselines treat mobility prediction as **classification over 40,000 grid cells** using **CrossEntropy (CE)**. CE penalizes any non-exact prediction equally, ignores **spatial similarity**, and lacks **sequence context**.
-
-**What GEO-BLEU brings (and the gap):**  
-- **Spatial similarity:** distance decay rewards nearby predictions.  
-- **Sequential matching:** **n-gram precision** evaluates multi-step patterns.  
-- **But:** Classic GEO-BLEU is **non-differentiable** (eval-only).
-
-**Our approach: make GEO-BLEU trainable via OT (Sinkhorn).**  
-1. **Local offsets & kernel weighting:** build a local window (e.g., 7×7) around each cell and compute distance-weighted similarities.  
-2. **n-gram similarity matrices:** for each n (1–5), slide over sequences to form predicted vs. true n-gram sets.  
-3. **Sinkhorn OT alignment:** treat n-gram sets as distributions; apply **entropy-regularized OT** with **log-domain Sinkhorn** to obtain a soft, differentiable alignment score.  
-4. **Loss aggregation:** weighted precision across n=1..5, combined with CE:  
-   Weighted precision across n = 1..5, combined with CE:
-
-  $$
-  L = \alpha \cdot CE + (1 - \alpha) \cdot \big( 1 - \mathrm{GeoBLEU} \big)
-  $$
-
-   Start CE-heavy, then anneal $\alpha$ to emphasize GeoBLEU.
-
-**Key hyperparameters:**  
-```python
-"combo": {
-    "ce_name": "ce",
-    "geobleu_kwargs": {
-        "H": 200, "W": 200,
-        "n_list": [1, 2, 3, 4, 5],
-        "win": 7,
-        "beta": 0.5,
-        "cell_km_x": 0.5, "cell_km_y": 0.5,
-        "distance_scale": 2.0,
-        "eps": 0.1,
-        "n_iters": 30
-    },
-    "alpha_warmup_epochs": 10,
-    "alpha_transition_epochs": 20
-}
-```
+Thus each timestep \(i\) is represented as a token vector \(\mathbf{h}^{(i)} \in \mathbb{R}^{544}\), obtained by concatenating all feature embeddings and then projected to the model dimension \(d_{\text{model}}=384\).
 
 ---
 
-## 4. Running
+### 3.2 CityCondBERT: Cross-City Transfer
 
-Our pipeline is driven by **argparse** with **best-known defaults in `config.py`**.  
-- CLI flags can override `config.py` at runtime.
+We target four cities (**A, B, C, D**).  
+Since B, C, and D have limited data, training separate models is impractical.  
+**CityCondBERT** addresses this by sharing a BERT-style Transformer encoder, while conditioning on **city embeddings** to enable transfer from data-rich city A.
 
-**Commands:**
+**Architecture.**  
+Built on Hugging Face’s `BertModel` with hidden size \(384\), 8 layers, 8 heads, and dropout 0.1.  
+It consumes enriched token embeddings (§3.1) and outputs contextualized hidden states.
+
+**City Conditioning.**  
+Each city ID \(c \in \{A,B,C,D\}\) maps to a vector \(\mathbf{e}_c \in \mathbb{R}^{32}\).  
+This embedding modulates the encoder via:  
+- **FiLM:** city-specific scale/shift on hidden states.  
+- **Adapters:** residual MLPs gated by city embeddings.  
+
+<p align="center">
+  <img src="figs/citycondbert.png" alt="CityCondBERT Architecture" width="700"/>
+</p>
+
+<p align="center"><em>Figure 2. CityCondBERT architecture for cross-city transfer.</em></p>
+
+---
+
+### 3.3 `GeoBleuSinkhornLoss`
+
+**Goal.**  
+Make GEO-BLEU **trainable** by turning n-gram matching into a **differentiable Sinkhorn-based alignment**.  
+This builds on the original GEO-BLEU similarity measure for geospatial sequences [[4]](#ref4) and leverages the Sinkhorn-Knopp algorithm for entropy-regularized optimal transport [[5]](#ref5).
+
+---
+
+**1) Local geometry.**  
+Neighboring cells should be treated as partially correct.  
+For each true cell \(y_j\), a local window (e.g., \(7\times7\)) is expanded and neighbors are weighted by distance decay:
+
+\[
+\omega(\Delta r, \Delta c) = \exp\big(-\beta \, d_{\text{km}}(\Delta r, \Delta c)\big).
+\]
+
+
+**2) 1-gram similarity.**  
+Given predicted distribution \(p_{i,v}\), the similarity to true step \(y_j\) is:
+
+\[
+U[i,j] = \sum_{k=1}^K p_{i,\, \text{nb}(y_j,k)} \cdot \tilde{\omega}_{j,k}.
+\]
+
+This captures spatial tolerance beyond exact matches.
+
+**3) n-gram extension.**  
+To model sequence patterns, define:
+
+\[
+S^{(n)}[i,j] = \prod_{t=0}^{n-1} U[i+t,\, j+t].
+\]
+
+This mimics BLEU’s n-gram precision but remains differentiable.
+
+<p align="center">
+  <img src="figs/geobleusinkhornloss.png" alt="n-gram Similarity Matrix S(n) for n=2" width="700"/>
+</p>
+
+<p align="center"><em>Figure 3. N-gram Similarity Matrix \(S^{(n)}\) for \(n=2\).</em></p>
+
+**4) Sinkhorn alignment.**  
+Each \(S^{(n)}\) is softly aligned via entropy-regularized OT:
+
+\[
+M^{(n)} = \mathrm{Sinkhorn}(S^{(n)}, \varepsilon),
+\qquad
+q_n = \langle M^{(n)}, S^{(n)} \rangle.
+\]
+
+
+**5) Loss.**  
+Aggregate over n-grams with weights \(w_n\):
+
+\[
+\mathcal{L}_{\text{GeoBLEU}} = - \sum_{n} w_n \, \log(q_n).
+\]
+
+---
+
+### 3.4 Learning Strategy
+
+Our training follows a **pretrain → finetune** paradigm:
+
+- **Pretraining.**  
+  The model is first pretrained on combined multi-city data (A, B, C, D).  
+  This stage focuses on learning general spatio-temporal representations without city-specific bias.  
+  A standard **CrossEntropy (CE)** objective is used to ensure stable convergence.
+- **Finetuning.**  
+  Starting from the pretrained weights, the model is finetuned on each target city using a **combo loss**:  
+  \[
+  L = \alpha \cdot CE + (1 - \alpha) \cdot \mathcal{L}_{\text{GeoBLEU}},
+  \]
+  with an **α-scheduler** that gradually shifts focus from CE to GeoBLEU, balancing token-level accuracy and trajectory-level coherence.  
+  During this stage, **embedding layers, input projection, and the BERT backbone are frozen**, while **FiLM, Adapters, and the output head** remain trainable, ensuring stable transfer without catastrophic forgetting.
+
+<p align="center">
+  <img src="figs/learning.png" alt="Learning Strategy" width="700"/>
+</p>
+
+<p align="center"><em>Figure 4. Cross-City Transfer Learning Strategy.</em></p>
+
+---
+
+## 4. Results
+
+We evaluate our approach on the four benchmark cities (A–D), comparing against a BERT baseline trained **from scratch**. The last column reports the relative GEO-BLEU improvement over scratch.
+
+
+| Methods                       | A (GEO-BLEU↑) | B (GEO-BLEU↑) | C (GEO-BLEU↑) | D (GEO-BLEU↑) | Δ vs Scratch (%) |
+|-------------------------------|---------------|---------------|---------------|---------------|------------------|
+| **BERT (scratch)**            | 0.1224        | 0.1145        | 0.1069        | 0.0993        | –                |
+| **CityCondBERT (pretrain)**   | 0.1275        | 0.1381        | 0.1276        | 0.1231        | +17.07%      |
+| **CityCondBERT + FT (CE)**    | <u>0.1299</u> | <u>0.1397</u> | <u>0.1296</u> | <u>0.1265</u> | +19.21%      |
+| **CityCondBERT + FT (Combo)** | **0.1313**    | **0.1420**    | **0.1311**    | **0.1280**    | **+20.73%**      |
+
+
+---
+
+## 5. Running
+
+The pipeline is organized into three main entry points:  
+
+- **`main_pretrain.py`** – trains a shared encoder on all cities jointly (multi-city pretraining).  
+- **`main_transfer.py`** – loads pretrained weights and finetunes the model on a specific target city (per-city adaptation).  
+- **`main_mask.py`** – performs masked prediction and evaluates the model, saving metrics and CSV outputs.
+
 ```bash
-# Train: full loop (train + validation) and final masked prediction
-python main.py --mode train --city A
-
-# Predict: load a saved checkpoint and run masked prediction only
-python main.py --mode predict --city A --model_name <run_name>
+{run_dir}/
+├── config.json # snapshot of parameters at training start
+├── run_meta.json # metadata (seed, host, timings)
+├── train_log.txt # per-epoch training/validation logs
+├── bert_best.pth # best checkpoint (by validation GEO-BLEU)
+├── bert_final.pth # final checkpoint (last epoch)
+├── results/
+│ ├── test/ # per-city token-level predictions (CSV)
+│ ├── metric/ # per-city UID-level evaluation (CSV)
+│ ├── mask/ # submission-style masked recovery outputs
+│ └── summary.txt # aggregated global + per-city metrics
 ```
 
-**Checkpoint structure (per run under `checkpoints/`):**
-```
-{model_name}-{YYYYMMDD}_{HHMMSS}/
-├── config.json     # snapshot of parameters at training start; reused at predict time
-├── run_meta.json   # run metadata (seed, host, timings)
-├── train_log.txt   # training/validation logs
-└── results/        # predictions, evaluation outputs
-```
 
 ---
 
-## 5. Tested Environments
+## 7. References
 
-| Environment | OS / Kernel | GPUs | Driver / CUDA |
-|---|---|---|---|
-| **Env 1 (5090×4)** | Ubuntu 25.04 (GNU/Linux 6.14.0-15-generic x86_64) | NVIDIA 5090 ×4 | Driver **570.133.07** / CUDA **12.8** |
-| **Env 2 (A5000×4)** | Ubuntu 20.04.6 LTS (GNU/Linux 5.15.0-139-generic x86_64) | NVIDIA A5000 ×4 | Driver **470.256.02** / CUDA **11.4** |
+[<a id="ref1">1</a>] He, H., Luo, H., & Wang, Q. R. (2024, October). **ST-MoE-BERT: A Spatial-Temporal Mixture-of-Experts Framework for Long-Term Cross-City Mobility Prediction.** In *Proceedings of the 2nd ACM SIGSPATIAL International Workshop on Human Mobility Prediction Challenge* (pp. 10–15).  
 
----
+[<a id="ref2">2</a>] Wu, X., He, H., Wang, Y., & Wang, Q. (2024). **Pretrained mobility transformer: A foundation model for human mobility.** *arXiv:2406.02578*.  
 
-## 6. Installation (Conda)
+[<a id="ref3">3</a>] Li, Y., Si, S., Li, G., Hsieh, C.-J., & Bengio, S. (2021). **Learnable Fourier Features for Multi-Dimensional Spatial Positional Encoding.** *Advances in Neural Information Processing Systems (NeurIPS 2021)*, 34, 15816–15829.  
 
-For exact reproduction, use the provided **Conda explicit specs** and choose the file matching your machine:
+[<a id="ref4">4</a>] Shimizu, T., Tsubouchi, K., & Yabe, T. (2022). **GEO-BLEU: Similarity measure for geospatial sequences.** *Proceedings of the 30th International Conference on Advances in Geographic Information Systems (SIGSPATIAL ’22)*, 1–4. ACM. https://doi.org/10.1145/3557915.3560985  
 
-- **5090×4 (CUDA 12.8)** → `requirements_5090.txt`  
-- **A5000×4 (CUDA 11.4)** → `requirements_A5000.txt`
-
-**Example:**
-```bash
-conda create -n env_name --file requirements_*.txt
-conda activate env_name
-```
-> Replace `requirements_*.txt` with the correct file for your machine.
-
----
-
-## 7. Citations
-
-- He et al. (2024) – ST-MoE-BERT  
-- Li et al. (2021) – Learnable Fourier Features  
-- Wu et al. (2024) – Pretrained Mobility Transformer
+[<a id="ref5">5</a>] Cuturi, M. (2013). **Sinkhorn distances: Lightspeed computation of optimal transport.** *Advances in Neural Information Processing Systems (NeurIPS 2013)*, 26, 2292–2300.  
