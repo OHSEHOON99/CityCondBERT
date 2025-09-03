@@ -187,9 +187,9 @@ Our training follows a **pretrain → finetune** paradigm:
 - **Finetuning.**  
   Starting from the pretrained weights, the model is finetuned on each target city using a **combo loss**:  
 
-  $$
-  L = \alpha \cdot L_{\mathrm{CE}} + (1 - \alpha) L_{\mathrm{GeoBLEU}}
-  $$
+$$
+L = \alpha \cdot L_{\mathrm{CE}} + (1 - \alpha) L_{\mathrm{GeoBLEU}}
+$$
 
   with an **α-scheduler** that gradually shifts focus from CE to GeoBLEU, balancing token-level accuracy and trajectory-level coherence.  
   During this stage, **embedding layers, input projection, and the BERT backbone are frozen**, while **FiLM, Adapters, and the output head** remain trainable.
