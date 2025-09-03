@@ -171,7 +171,7 @@ $$
 Aggregate over n-grams with weights $w_n$:
 
 $$
-\mathcal{L}_{\mathrm{GeoBLEU}} = - \sum_{n} w_n \,\log(q_n).
+\mathcal{L}_\mathrm{GeoBLEU}= - \sum_{n} w_n \,\log(q_n).
 $$
 
 ---
@@ -188,7 +188,7 @@ Our training follows a **pretrain → finetune** paradigm:
   Starting from the pretrained weights, the model is finetuned on each target city using a **combo loss**:  
 
     $$
-    L = \alpha \cdot \mathrm{CE} + (1 - \alpha) \cdot \mathcal{L}_{\mathrm{GeoBLEU}}.
+    L = \alpha \cdot \mathrm{CE} + (1 - \alpha) \cdot \mathcal{L}_\mathrm{GeoBLEU}.
     $$
 
   with an **α-scheduler** that gradually shifts focus from CE to GeoBLEU, balancing token-level accuracy and trajectory-level coherence.  
