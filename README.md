@@ -24,7 +24,7 @@ We address the task of **masked trajectory recovery**, where the goal is to reco
 Each user $u$ has a (sparse) trajectory:
 
 $$
-\mathcal{T}_u \;=\; \big\{\, (d^{(i)},\, t^{(i)},\, x^{(i)},\, y^{(i)}) \in \mathbb{Z}^4 \ \big| \ i=1,\dots,N_u \,\big\},
+\mathcal{T}_u = \{ (d^{(i)}, t^{(i)}, x^{(i)}, y^{(i)}) \in \mathbb{Z}^4 \ | \ i=1,\dots,N_u \},
 $$
 
 where $d^{(i)} \in [1,75]$ is the day index, $t^{(i)} \in [1,48]$ the half-hour slot, and $(x^{(i)}, y^{(i)}) \in [1,200]$ the grid coordinates.
@@ -32,7 +32,7 @@ where $d^{(i)} \in [1,75]$ is the day index, $t^{(i)} \in [1,48]$ the half-hour 
 From $\mathcal{T}_u$, we derive an enriched sequence:
 
 $$
-S_u \;=\; \big\{\, (d^{(i)},\, l^{(i)},\, t^{(i)},\, w^{(i)},\, b^{(i)},\, \delta^{(i)}) \ \big| \ i=1,\dots,N_u \,\big\},
+S_u = \{ (d^{(i)}, l^{(i)}, t^{(i)}, w^{(i)}, b^{(i)}, \delta^{(i)}) \ | \ i=1,\dots,N_u \},
 $$
 
 where $l^{(i)} = (y^{(i)} - 1)\cdot 200 + x^{(i)} \in \{1,\dots,40000\}$.  
@@ -41,19 +41,19 @@ Here, $w^{(i)} \in \{1,\dots,7\}$ denotes the day-of-week, $b^{(i)} \in \{1,2\}$
 We define a fixed masking window over the final 15 days:
 
 $$
-\mathcal{M}_u \;=\; \big\{\, i \ \big| \ d^{(i)} \in [61,75] \,\big\}, 
+\mathcal{M}_u = \{ i \ | \ d^{(i)} \in [61,75] \}, 
 \qquad
-l^{(i)} \;=\; 40001 \ \text{ (i.e., [MASK]) if } i \in \mathcal{M}_u.
+l^{(i)} = 40001 \ \text{ (i.e., [MASK]) if } i \in \mathcal{M}_u.
 $$
 
 Here, **40001 explicitly marks “to-be-predicted” locations**, following the masking strategy adopted in prior work such as ST-MoE-BERT [[1]](#ref1).
 
-Because $N_u$ varies across users, we pad each sequence to a batch length $L$ with PAD $=0$; padded positions are excluded from attention (``attention_mask = 0``), while masked-future tokens $i \in \mathcal{M}_u$ remain active.
+Because $N_u$ varies across users, we pad each sequence to a batch length $L$ with PAD $=0$; padded positions are excluded from attention (`attention_mask = 0`), while masked-future tokens $i \in \mathcal{M}_u$ remain active.
 
 The model learns a mapping function:
 
 $$
-f_\theta(S_u) \;=\; \big\{\, \hat l^{(i)} \ \big| \ i \in \mathcal{M}_u \,\big\},
+f_\theta(S_u) = \{ \hat l^{(i)} \ | \ i \in \mathcal{M}_u \},
 $$
 
 by minimizing the prediction error **only at masked positions** using both masked and unmasked parts of $S_u$.
@@ -171,7 +171,7 @@ $$
 Aggregate over n-grams with weights $w_n$:
 
 $$
-\mathcal{L}_{\text{GeoBLEU}} \;=\; - \sum_{n} w_n \, \log\!\big(q_n\big).
+\mathcal{L}_{\text{GeoBLEU}} = - \sum_{n} w_n \, \log(q_n).
 $$
 
 ---
@@ -188,7 +188,7 @@ Our training follows a **pretrain → finetune** paradigm:
   Starting from the pretrained weights, the model is finetuned on each target city using a **combo loss**:  
 
     $$
-    L \;=\; \alpha \cdot \mathrm{CE} \;+\; (1 - \alpha) \cdot \mathcal{L}_{\text{GeoBLEU}}.
+    L = \alpha \cdot \mathrm{CE} + (1 - \alpha) \cdot \mathcal{L}_{\text{GeoBLEU}}.
     $$
 
   with an **α-scheduler** that gradually shifts focus from CE to GeoBLEU, balancing token-level accuracy and trajectory-level coherence.  
