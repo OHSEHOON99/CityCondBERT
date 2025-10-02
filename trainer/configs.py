@@ -2,7 +2,7 @@
 # Canonical config builder
 # ----------------------------
 def to_canonical_config(cfg, num_location_ids):
-    # transformer (canonical or legacy)
+    # Transformer (canonical or legacy)
     transformer_cfg = cfg.get("transformer", {
         "hidden_size":     cfg["hidden_size"],
         "hidden_layers":   cfg["hidden_layers"],
@@ -11,7 +11,7 @@ def to_canonical_config(cfg, num_location_ids):
         "max_seq_length":  cfg["max_seq_length"],
     })
 
-    # embedding sizes (canonical or legacy)
+    # Embedding sizes (canonical or legacy)
     embedding_sizes = cfg.get("embedding_sizes", {
         "day":      cfg["day_embedding_size"],
         "time":     cfg["time_embedding_size"],
@@ -21,9 +21,11 @@ def to_canonical_config(cfg, num_location_ids):
     })
 
     feature_configs = cfg["feature_configs"]
-    feature_combine_mode = cfg.get("feature_combine_mode",
-                                   cfg.get("embedding_combine_mode", "cat"))
-    
+    feature_combine_mode = cfg.get(
+        "feature_combine_mode",
+        cfg.get("embedding_combine_mode", "cat")
+    )
+
     delta_embedding_dims = tuple(cfg["delta_embedding_dims"])
 
     return {
@@ -39,7 +41,7 @@ def to_canonical_config(cfg, num_location_ids):
 
 
 def make_loss_kwargs_from_cfg(cfg):
-    # 공통 그리드/셀
+    """Build loss function kwargs from configuration."""
     H = int(cfg.get("H", 200))
     W = int(cfg.get("W", 200))
     cell_km_x = float(cfg.get("cell_km_x", 0.5))
@@ -77,13 +79,12 @@ def make_loss_kwargs_from_cfg(cfg):
         }
 
     elif loss_name == "combo":
-        # combo 설정 읽기
+        # Combo loss configuration
         c = cfg.get("combo", {})
         ce_name = c.get("ce_name", "ce").lower()
 
-        # ce_kwargs 구성
+        # CE kwargs
         if ce_name == "ddce":
-            # ddce를 CE로 쓸 경우 grid/셀크기 포함 필요
             base = cfg.get("ddce", {})
             ck = c.get("ce_kwargs", {})
             ce_kwargs = {
@@ -96,15 +97,14 @@ def make_loss_kwargs_from_cfg(cfg):
                 "reduction": ck.get("reduction", base.get("reduction", "mean")),
             }
         else:
-            # 일반 CE
             ce_kwargs = c.get("ce_kwargs", {})
 
-        # geobleu_kwargs 구성 (필수 H/W/셀 크기 ensure)
+        # GeoBLEU kwargs
         gk = c.get("geobleu_kwargs", {})
         geobleu_kwargs = {
             "H": int(gk.get("H", H)),
             "W": int(gk.get("W", W)),
-            "n_list": tuple(gk.get("n_list", cfg.get("geobleu", {}).get("n_list", [1,2,3,4,5]))),
+            "n_list": tuple(gk.get("n_list", cfg.get("geobleu", {}).get("n_list", [1, 2, 3, 4, 5]))),
             "win": int(gk.get("win", cfg.get("geobleu", {}).get("win", 7))),
             "beta": float(gk.get("beta", cfg.get("geobleu", {}).get("beta", 0.5))),
             "cell_km_x": float(gk.get("cell_km_x", cell_km_x)),
@@ -122,7 +122,7 @@ def make_loss_kwargs_from_cfg(cfg):
             "alpha_init": float(c.get("alpha_init", 1.0)),
             "ema_m": float(c.get("ema_m", 0.99)),
             "track_mavg": bool(c.get("track_mavg", True)),
-            # 선택: α가 매우 높을 땐 GeoBLEU 계산 스킵하여 속도↑
+            # Optionally skip GeoBLEU when alpha is high for faster training
             "skip_geobleu_when_alpha_ge": float(c.get("skip_geobleu_when_alpha_ge", 0.999)),
         }
 
@@ -132,16 +132,17 @@ def make_loss_kwargs_from_cfg(cfg):
 
 def alpha_sched(epoch: int, combo_cfg: dict) -> float:
     """
-    cfg['combo']에서 스케줄 파라미터 읽어 α를 반환.
-    - warmup 동안 α=1.0 (CE only)
-    - transition 동안 선형으로 a_start -> a_end
+    Compute alpha schedule based on combo_cfg.
+    - α = 1.0 during warmup (CE only)
+    - Linearly decays from a_start → a_end during transition
     """
     e_warm = int(combo_cfg.get("alpha_warmup_epochs", 5))
     e_trans = int(combo_cfg.get("alpha_transition_epochs", 3))
     a_start = float(combo_cfg.get("alpha_start", 0.9))
-    a_end   = float(combo_cfg.get("alpha_end", 0.3))
+    a_end = float(combo_cfg.get("alpha_end", 0.3))
 
     if epoch < e_warm:
         return 1.0
-    r = min(1.0, (epoch - e_warm) / max(1, e_trans))  # 0→1
-    return a_start + (a_end - a_start) * r            # linear
+
+    r = min(1.0, (epoch - e_warm) / max(1, e_trans))
+    return a_start + (a_end - a_start) * r

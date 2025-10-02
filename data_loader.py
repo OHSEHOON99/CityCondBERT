@@ -229,9 +229,6 @@ def load_and_split_data(
         fc = str(file_city).strip().upper()
 
         if mode == "pretrain":
-            # ▶ pretrain에서도 city 인자를 반드시 사용
-            #    - city=ALL → 전체 사용
-            #    - city in {A,B,C,D} → 해당 도시만
             if c is None:
                 raise ValueError("mode='pretrain' requires --city in {'A','B','C','D','all'}")
             if c == "ALL":
@@ -241,13 +238,11 @@ def load_and_split_data(
             return fc == c
 
         elif mode == "transfer":
-            # 기존 정책 유지: transfer는 특정 도시만 허용, ALL 금지
             if c is None or c == "ALL" or c not in {"A", "B", "C", "D"}:
                 raise ValueError("mode='transfer' requires city to be one of {'A','B','C','D'} (not 'all')")
             return fc == c
 
         else:  # predict
-            # predict는 ALL 허용 (기존 동작 유지)
             if c in (None, "", "ALL"):
                 return True
             if c not in {"A", "B", "C", "D"}:

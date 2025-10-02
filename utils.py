@@ -10,6 +10,7 @@ import wandb
 from models.model import CityCondBERT
 
 
+
 def id_to_xy(loc_ids, grid_width=200):
     """Convert location IDs to (x, y) coordinates (1-based)."""
     x = (loc_ids // grid_width) + 1
@@ -23,8 +24,8 @@ def xy_to_id(x, y, grid_width=200):
 
 
 def save_config(config_dict, save_dir, filename='config.json'):
-    """설정을 JSON으로 저장."""
-    os.makedirs(save_dir, exist_ok=True)              # ✅ 폴더 보장
+    """Save configuration as JSON."""
+    os.makedirs(save_dir, exist_ok=True)
     path = os.path.join(save_dir, filename)
     with open(path, 'w') as f:
         json.dump(config_dict, f, indent=4)
@@ -117,7 +118,6 @@ def resume_wandb_by_timestamp(wandb_dir, target_run_name,
 
 
 def build_model_from_config(cfg, device, num_location_ids):
-    # Transformer config
     if "transformer" in cfg and isinstance(cfg["transformer"], dict):
         transformer_cfg = cfg["transformer"]
     else:
@@ -129,7 +129,6 @@ def build_model_from_config(cfg, device, num_location_ids):
             "max_seq_length":  int(cfg["max_seq_length"]),
         }
 
-    # Embedding sizes
     if "embedding_sizes" in cfg and isinstance(cfg["embedding_sizes"], dict):
         embedding_sizes = cfg["embedding_sizes"]
     else:
@@ -141,17 +140,11 @@ def build_model_from_config(cfg, device, num_location_ids):
             "location": int(cfg["location_embedding_size"]),
         }
 
-    # Delta dims
     delta_embedding_dims = tuple(cfg.get("delta_embedding_dims", (8, 8, 8)))
-
-    # Feature configs
     feature_configs = cfg["feature_configs"]
-
-    # Combine mode
     feature_combine_mode = cfg.get("feature_combine_mode",
                                    cfg.get("embedding_combine_mode", "cat"))
 
-    # Transfer knobs
     use_film       = cfg.get("use_film", True)
     apply_film_at  = cfg.get("apply_film_at", "post")
     film_share     = cfg.get("film_share", True)
@@ -181,7 +174,6 @@ def build_model_from_config(cfg, device, num_location_ids):
         adapter_dropout=adapter_dropout,
     ).to(device)
 
-    # Freeze options
     if str(cfg.get("freeze_backbone", "false")).lower() == "true":
         model.freeze_backbone()
     if str(cfg.get("freeze_head", "false")).lower() == "true":
@@ -189,6 +181,7 @@ def build_model_from_config(cfg, device, num_location_ids):
             p.requires_grad = False
 
     return model
+
 
 def safe_ids_to_xy(ids_np, W):
     """Call utils.id_to_xy with or without grid_width depending on signature."""

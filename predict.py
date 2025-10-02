@@ -24,25 +24,20 @@ def predict(
     model.eval()
     os.makedirs(output_dir, exist_ok=True)
 
-    # --- 새 경로 (요구사항) ---
     pred_dir   = os.path.join(output_dir, "test")
     metric_dir = os.path.join(output_dir, "metric")
     os.makedirs(pred_dir, exist_ok=True)
     os.makedirs(metric_dir, exist_ok=True)
 
-    # 버퍼: 도시별 토큰 / UID 묶음
     tok_buf_per_city = defaultdict(list)
     uid_rows = []
 
-    # 전역 micro 정확도
     total_tokens = 0
     total_correct = 0
 
-    # 도시별 micro 정확도 누적
     city_tokens  = defaultdict(int)
     city_correct = defaultdict(int)
 
-    # --- ID -> 도시 문자열 태그 ---
     def city_tag(cid: int) -> str:
         try:
             return str(ID2CITY.get(int(cid), str(cid)))
@@ -79,7 +74,6 @@ def predict(
             if not mask_pos.any().item():
                 continue
 
-            # --- 배치 평탄화 ---
             b_idx, t_idx = torch.where(mask_pos)
             true_all = labels[b_idx, t_idx].detach().cpu().numpy()
             pred_all = torch.argmax(logits_masked, dim=-1).detach().cpu().numpy()
@@ -89,12 +83,10 @@ def predict(
             uid_all  = uids[b_idx].detach().cpu().numpy()
             city_all = city_ids[b_idx].detach().cpu().numpy()
 
-            # --- 전역 micro ---
             total_tokens  += true_all.size
             batch_correct = int((pred_all == true_all).sum())
             total_correct += batch_correct
 
-            # --- 도시별 micro 누적 ---
             if true_all.size:
                 sort_c = np.argsort(city_all, kind="mergesort")
                 c_sorted = city_all[sort_c]
@@ -104,7 +96,6 @@ def predict(
                     city_tokens[int(cid)]  += int(c)
                     city_correct[int(cid)] += int(eq_sorted[s:s+c].sum())
 
-            # --- UID 그룹핑 ---
             sort_idx = np.argsort(uid_all, kind="mergesort")
             uid_s = uid_all[sort_idx]
             d_s   = d_all[sort_idx]
@@ -136,7 +127,6 @@ def predict(
                 }
                 uid_rows.append(row)
 
-            # --- 토큰 CSV 버퍼에 저장 ---
             if save_csv:
                 pred_xy = safe_ids_to_xy(pred_all, W).astype(np.int32, copy=False)
                 true_xy = safe_ids_to_xy(true_all, W).astype(np.int32, copy=False)
@@ -154,7 +144,6 @@ def predict(
                     tag = city_tag(int(cid))
                     tok_buf_per_city[tag].append(gdf)
 
-    # --- UID 메트릭: 도시별 파일 저장 ---
     df_uid = pd.DataFrame(uid_rows) if uid_rows else pd.DataFrame(
         columns=["uid","city_id","seq_len","geobleu","dtw","acc","city"]
     )
@@ -164,13 +153,11 @@ def predict(
                 os.path.join(metric_dir, f"city_{tag}.csv"), index=False
             )
 
-    # --- 토큰 CSV: 도시별 저장 ---
     if save_csv:
         for tag, buflist in tok_buf_per_city.items():
             df_all = pd.concat(buflist, ignore_index=True) if buflist else pd.DataFrame()
             df_all.to_csv(os.path.join(pred_dir, f"city_{tag}.csv"), index=False)
 
-    # --- summary.txt ---
     summary_path = os.path.join(output_dir, "summary.txt")
     with open(summary_path, "w", encoding="utf-8") as f:
         avg_geobleu = float(df_uid["geobleu"].mean()) if not df_uid.empty else 0.0
@@ -206,35 +193,26 @@ def predict(
                     f"uids={n_uids}, tokens_uid_sum={n_tokens_uid}, "
                     f"geobleu_macro_uid={geobleu_macro:.6f}, dtw_macro_uid={dtw_macro:.6f}, acc_macro_uid={acc_macro:.6f}\n"
                 )
-    # ===== WandB logging (per-city + global) =====
     try:
         import wandb
-        # global
         wandb.log({
             "test/geobleu": float(df_uid["geobleu"].mean()) if not df_uid.empty else 0.0,
             "test/dtw": float(df_uid["dtw"].mean()) if not df_uid.empty else 0.0,
             "test/acc": float(total_correct / max(1, total_tokens))
         })
 
-        # per-city
         if not df_uid.empty or city_tokens:
             seen_cids = set(int(c) for c in df_uid["city_id"].unique()) if not df_uid.empty else set()
             seen_cids |= set(city_tokens.keys())
             for cid in sorted(seen_cids):
                 tag = city_tag(int(cid))
-                n_tok = city_tokens.get(int(cid), 0)
-                n_cor = city_correct.get(int(cid), 0)
-                acc_micro = (n_cor / n_tok) if n_tok > 0 else 0.0
-
                 if not df_uid.empty:
                     sub = df_uid[df_uid["city_id"] == cid]
                     geobleu_macro = float(sub["geobleu"].mean()) if not sub.empty else 0.0
                     dtw_macro     = float(sub["dtw"].mean())     if not sub.empty else 0.0
                     acc_macro     = float(sub["acc"].mean())     if not sub.empty else 0.0
-                    n_uids        = int(sub["uid"].nunique())
                 else:
                     geobleu_macro = dtw_macro = acc_macro = 0.0
-                    n_uids = 0
 
                 wandb.log({
                     f"{tag}/geobleu": geobleu_macro,
@@ -247,15 +225,12 @@ def predict(
     return avg_geobleu, avg_dtw, avg_acc
 
 
-# ---------------------------
-# Predict masked UID segments (submission-style) -> save under results/mask
-# ---------------------------
 @torch.no_grad()
 def predict_masked_uid(
     model,
     mask_loader,
     device,
-    city="A",                 # "A" | "B" | "C" | "D" | "ALL"
+    city="A",
     output_dir="./results",
     W=200,
     team_name="SCSI"
@@ -276,12 +251,10 @@ def predict_masked_uid(
 
     city_upper = str(city).upper()
 
-    # fallback id->letter (dataset이 1~4면 이 매핑 사용)
     fallback_id2city = {1: "A", 2: "B", 3: "C", 4: "D"}
 
-    # city == ALL 이면 도시별 버킷으로 누적
     per_city_rows = defaultdict(list)
-    single_city_rows = []  # 단일 도시 모드에서만 사용
+    single_city_rows = []
 
     pbar = tqdm(mask_loader, desc=f"[Predict-999|city={city_upper}]", ncols=100)
     for batch in pbar:
@@ -299,13 +272,13 @@ def predict_masked_uid(
 
         logits_masked, mask_pos = model(
             feats_pad, attention_mask, labels=labels_mlm, city_ids=city_ids
-        )  # logits_masked: (N_mask,V), mask_pos: (B,L)
+        )
 
         if not mask_pos.any().item():
             continue
 
         B, L = mask_pos.shape
-        pred_ids_all = torch.argmax(logits_masked, dim=-1).long()  # (N_mask,)
+        pred_ids_all = torch.argmax(logits_masked, dim=-1).long()
 
         counts = mask_pos.sum(dim=1).tolist()
         offsets = np.cumsum([0] + counts)
@@ -316,7 +289,7 @@ def predict_masked_uid(
                 continue
 
             s, e = offsets[b], offsets[b + 1]
-            pos_b = mask_pos[b].nonzero(as_tuple=True)[0]  # (n,)
+            pos_b = mask_pos[b].nonzero(as_tuple=True)[0]
 
             d_b = (feats_pad[b, pos_b, 0] - 1).detach().cpu().numpy().astype(np.int64)
             t_b = (feats_pad[b, pos_b, 1] - 1).detach().cpu().numpy().astype(np.int64)
@@ -324,11 +297,9 @@ def predict_masked_uid(
             pred_ids_b = pred_ids_all[s:e].detach().cpu().numpy()
             pred_xy_b = safe_ids_to_xy(pred_ids_b, W).astype(np.int64)
 
-            # 이 샘플의 city tag 결정
             cid_b = int(city_ids[b].item())
-            tag_b = fallback_id2city.get(cid_b, str(cid_b))  # ex) 1->"A"
+            tag_b = fallback_id2city.get(cid_b, str(cid_b))
 
-            # rows 작성
             for (dd, tt), (px, py) in zip(zip(d_b, t_b), pred_xy_b):
                 row = {"uid": uid_b, "d": int(dd), "t": int(tt), "x": int(px), "y": int(py)}
                 if city_upper == "ALL":
@@ -336,7 +307,6 @@ def predict_masked_uid(
                 else:
                     single_city_rows.append(row)
 
-    # === 저장 ===
     if city_upper == "ALL":
         dfs = {}
         for tag, rows in sorted(per_city_rows.items()):

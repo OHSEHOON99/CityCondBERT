@@ -106,7 +106,6 @@ def main():
         except Exception as e:
             print(f"[W&B] Resume failed: {e}")
 
-        # ✅ 변경: save_name/id2city_map/save_city_csv 제거
         geobleu, dtw, acc = predict(
             model=model,
             test_loader=test_loader,
@@ -126,7 +125,7 @@ def main():
             model=model,
             mask_loader=mask_loader,
             device=device,
-            city=cfg["city"],   # "ALL"이면 A/B/C/D로 분리 저장
+            city=cfg["city"],
             output_dir=output_dir,
             W=W,
             team_name="SCSI"

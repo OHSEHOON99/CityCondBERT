@@ -249,11 +249,11 @@ class CityCondBERT(nn.Module):
                     lr_location: Optional[float] = None,
                     weight_decay: float = 0.01) -> List[Dict]:
         """
-        Optimizer param groups with LR split + no-decay split + location-embedding split.
-        - lr_head: if None -> lr_backbone
-        - lr_location: if None -> lr_backbone
-        - freeze_head: exclude head params when True
-        - weight_decay: applied only to *decay* groups
+        Build optimizer param groups with LR split, no-decay split, and location-embedding split.
+        - lr_head: if None → lr_backbone
+        - lr_location: if None → lr_backbone
+        - freeze_head: exclude head params if True
+        - weight_decay: applied only to decay groups
         """
         groups: List[Dict] = []
         if lr_head is None:
@@ -263,25 +263,24 @@ class CityCondBERT(nn.Module):
 
         # -------- helpers --------
         def is_no_decay_param(name: str) -> bool:
-            # bias & LayerNorm.* (HF BERT는 LayerNorm.weight 사용)
+            # bias & LayerNorm.* (HF BERT uses LayerNorm.weight)
             return (
                 name.endswith(".bias")
                 or name.endswith("LayerNorm.weight")
-                or ".layer_norm." in name  # 안전망
+                or ".layer_norm." in name
                 or name.endswith(".ln.weight")
             )
 
         # ========== BACKBONE ==========
         bb_decay, bb_nodecay, loc_params = [], [], []
 
-        # Embedding 모듈: location embedding 분리 (wd=0)
+        # Embedding module: separate location embedding (wd=0)
         for n, p in self.embedding.named_parameters():
             if not p.requires_grad:
                 continue
             if "feature_blocks.location" in n:
-                loc_params.append(p)  # 전용 그룹 (wd=0)
+                loc_params.append(p)
             elif is_no_decay_param(n) or (".embedding" in n and n.endswith(".weight")):
-                # 임베딩 weight는 보통 wd=0이 유리
                 bb_nodecay.append(p)
             else:
                 bb_decay.append(p)
@@ -340,6 +339,7 @@ class CityCondBERT(nn.Module):
             groups.append({"params": tr_nodecay, "lr": lr_transfer, "weight_decay": 0.0})
 
         return groups
+
 
     # ------------
     # Forward

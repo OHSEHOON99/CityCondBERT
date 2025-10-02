@@ -15,6 +15,9 @@ Our system introduces four key components:
 3. **Differentiable objective: `GeoBleuSinkhornLoss`**  
 4. **Learning strategy**
 
+CityCondBERT improves GEO-BLEU by approximately **25%** over per-city BERT baselines trained from scratch, achieving a **GEO-BLEU of 0.1516** on the organizers’ evaluation split and ranking **among the top five** teams.
+
+
 ---
 
 ## 2. Problem Definition
@@ -71,14 +74,16 @@ To exploit these signals, we design complementary encoders:
 - **Periodic encodings** for cyclic proximity, following Wu et al. (2024) [[2]](#ref2)  
 - **Learnable Fourier features** for continuous deltas, following Li et al. (2021) [[3]](#ref3)  
 
-| Feature              | Notation      | Type / Encoding               | Dim.   |
-|----------------------|---------------|-------------------------------|--------|
-| Day index            | $d^{(i)}$    | Categorical                   | 64     |
-| Time-of-day          | $t^{(i)}$    | Categorical ⊕ Periodic (48)  | 64 + 64|
-| Day-of-week          | $w^{(i)}$    | Categorical ⊕ Periodic (7)   | 32 + 32|
-| Weekday/Weekend flag | $b^{(i)}$    | Categorical                   | 16     |
-| Location (grid ID)   | $l^{(i)}$    | Categorical                   | 256    |
-| Delta (time gap)     | $\delta^{(i)}$ | Learnable Fourier (`log1p`) | 16     |
+| Feature              | Notation        | Type / Encoding               | Dim.   |
+|----------------------|-----------------|-------------------------------|--------|
+| Day index            | $d^{(i)}$       | Categorical                   | 64     |
+| Time-of-day          | $t^{(i)}$       | Categorical ⊕ Periodic (48)  | 64 + 64|
+| Day-of-week          | $w^{(i)}$       | Categorical ⊕ Periodic (7)   | 32 + 32|
+| Weekday/Weekend flag | $b^{(i)}$       | Categorical                   | 16     |
+| Location (grid ID)   | $l^{(i)}$       | Categorical                   | 256    |
+| Delta (time gap)     | $\delta^{(i)}$  | Learnable Fourier (`log1p`)   | 16     |
+| City ID              | $c^{(i)}$       | Categorical                   | 32     |
+
 
 <br>
 
@@ -171,7 +176,7 @@ $$
 Aggregate over n-grams with weights $w_n$:
 
 $$
-L_{\mathrm{GeoBLEU}} = - \sum_{n=1}^5 w_n \log(q_n)
+\mathcal{L}_{\mathrm{GeoBLEU}} = -\sum_{n} w_n \log q_n
 $$
 
 ---
@@ -208,10 +213,10 @@ We evaluate our approach on the four benchmark cities (A–D), comparing against
 
 | Methods                       | A (GEO-BLEU↑) | B (GEO-BLEU↑) | C (GEO-BLEU↑) | D (GEO-BLEU↑) | Δ vs Scratch (%) |
 |-------------------------------|---------------|---------------|---------------|---------------|------------------|
-| **BERT (scratch)**            | 0.1224        | 0.1145        | 0.1069        | 0.0993        | –                |
-| **CityCondBERT (pretrain)**   | 0.1275        | 0.1381        | 0.1276        | 0.1231        | +17.07%          |
-| **CityCondBERT + FT (CE)**    | <u>0.1299</u> | <u>0.1397</u> | <u>0.1296</u> | <u>0.1265</u> | +19.21%          |
-| **CityCondBERT + FT (Combo)** | **0.1313**    | **0.1420**    | **0.1311**    | **0.1280**    | **+20.73%**      |
+| **BERT (scratch)**            | 0.1243        | 0.1133        | 0.1073        | 0.0971        | –                |
+| **CityCondBERT (pretrain)**   | 0.1289        | 0.1398        | 0.1293        | 0.1256        | +19.17%          |
+| **CityCondBERT + FT (CE)**    | <u>0.1334</u> | <u>0.1441</u> | <u>0.1348</u> | <u>0.1304</u> | +23.56%          |
+| **CityCondBERT + FT (Combo)** | **0.1341**    | **0.1461**    | **0.1361**    | **0.1331**    | **+25.17%**      |
 
 ---
 

@@ -107,28 +107,27 @@ def main():
     eval_model.eval()
     print(f"[Load] Best model loaded from {best_model_path}")
 
-    # 새 predict 시그니처에 맞게 호출 (save_name/id2city_map/save_city_csv 제거)
     geobleu, dtw, acc = predict(
         model=eval_model,
         test_loader=test_loader,
         device=device,
         output_dir=output_dir,
         W=W,
-        save_csv=True,  # 결과를 results/test & results/metric에 저장 + summary.txt 생성
+        save_csv=True,
     )
     print(f"[Transfer/Test] GEO-BLEU: {geobleu:.4f}, DTW: {dtw:.2f}, Accuracy: {acc*100:.2f}%")
 
     # 8) x==999 masked-UID prediction using mask_loader
     if mask_loader is not None:
-        city_code = str(final_cfg.get("city", "A")).upper()  # 전이 단계: 설정에서 city 사용
+        city_code = str(final_cfg.get("city", "A")).upper()
         predict_masked_uid(
             model=eval_model,
             mask_loader=mask_loader,
             device=device,
-            city=city_code,            # "ALL"이면 A/B/C/D로 분리 저장
+            city=city_code,
             output_dir=output_dir,
             W=W,
-            team_name="SCSI",          # 항상 저장하도록 구현됨 (save_csv 인자 제거)
+            team_name="SCSI",
         )
         print(f"[Transfer/Mask] Saved masked predictions for city {city_code}")
 
